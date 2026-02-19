@@ -389,7 +389,9 @@ Weather app/
 ├── analytics/            # Analys och statistik
 │   ├── analyzer.py
 │   ├── statistics.py
-│   └── warnings.py
+│   ├── warnings.py
+│   ├── graph_generator.py
+│   └── graph_modes.py
 ├── gui/                  # GUI-komponenter
 │   ├── main_window.py
 │   ├── city_panel.py
@@ -401,12 +403,6 @@ Weather app/
 │   ├── stations_tab.py
 │   ├── api_status_tab.py
 │   └── logs_tab.py
-├── analytics/            # Analys och statistik
-│   ├── analyzer.py
-│   ├── statistics.py
-│   ├── warnings.py
-│   ├── graph_generator.py
-│   └── graph_modes.py
 └── utils/                # Hjälpfunktioner
     ├── logger.py
     ├── config_loader.py
