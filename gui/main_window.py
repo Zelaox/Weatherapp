@@ -107,19 +107,18 @@ class MainWindow(QMainWindow):
         # Graph generation worker
         self.graph_worker = None
         
-        # GUI refresh timer for real-time updates (separate from auto-update)
-        # This updates the display with data from database, doesn't fetch from APIs
-        self.gui_refresh_timer = QTimer()
-        self.gui_refresh_timer.timeout.connect(self.refresh_all)
-        # Refresh GUI every 5 seconds (5000 ms)
-        self.gui_refresh_timer.setInterval(5000)
-        self.gui_refresh_timer.setSingleShot(False)  # Repeat continuously
+        # Debounce timer for multiple simultaneous updates
+        # When multiple cities update at once, wait 100ms then refresh once
+        self.refresh_debounce_timer = QTimer()
+        self.refresh_debounce_timer.setSingleShot(True)
+        self.refresh_debounce_timer.timeout.connect(self.refresh_all)
+        self.pending_refresh = False
         
         self._init_ui()
         
-        # Start GUI refresh timer automatically (always active)
-        self.gui_refresh_timer.start()
-        self.controller.logger.info("GUI real-time refresh startad (5 sekunder intervall)")
+        # Connect data_updated signal to refresh (event-driven)
+        self.controller.data_updated.connect(self._on_data_updated)
+        self.controller.logger.info("Event-driven UI refresh aktiverad (uppdateras endast vid ny data)")
     
     def _init_ui(self):
         """Initialize UI components."""
@@ -324,8 +323,27 @@ class MainWindow(QMainWindow):
             self.graph_worker.wait()
             self.graph_worker = None
     
+    def _on_data_updated(self, city_id: int, data_id: int):
+        """
+        Handle data_updated signal with debouncing.
+        
+        Args:
+            city_id: City ID that was updated
+            data_id: Data ID that was inserted
+        """
+        # Mark that we have a pending refresh
+        self.pending_refresh = True
+        
+        # If timer is not running, start it (100ms debounce)
+        if not self.refresh_debounce_timer.isActive():
+            self.refresh_debounce_timer.start(100)
+            self.controller.logger.debug(f"Data uppdaterad för stad {city_id} (data_id: {data_id}), schemalägger UI-refresh")
+    
     def refresh_all(self):
         """Refresh all UI components."""
+        # Reset pending flag
+        self.pending_refresh = False
+        
         self.city_panel.refresh()
         self.weather_panel.refresh()
         self.history_tab.refresh()

@@ -7,6 +7,24 @@ from pathlib import Path
 from typing import Optional
 
 
+class LevelFilter(logging.Filter):
+    """Filter to allow only specific log levels."""
+    
+    def __init__(self, allowed_levels):
+        """
+        Initialize filter.
+        
+        Args:
+            allowed_levels: List of log levels to allow (e.g., [logging.ERROR, logging.CRITICAL])
+        """
+        super().__init__()
+        self.allowed_levels = allowed_levels
+    
+    def filter(self, record):
+        """Filter log records by level."""
+        return record.levelno in self.allowed_levels
+
+
 class WeatherLogger:
     """Centralized logging for weather application."""
     
@@ -32,24 +50,43 @@ class WeatherLogger:
         # Remove existing handlers
         self.logger.handlers.clear()
         
-        # File handler
-        log_file = self.log_dir / f"weather_{datetime.now().strftime('%Y%m%d')}.log"
-        file_handler = logging.FileHandler(log_file, encoding='utf-8')
-        file_handler.setLevel(log_level)
-        
-        # Console handler
-        console_handler = logging.StreamHandler()
-        console_handler.setLevel(log_level)
+        # Get date string for log filenames
+        date_str = datetime.now().strftime('%Y%m%d')
         
         # Formatter
         formatter = logging.Formatter(
             '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
             datefmt='%Y-%m-%d %H:%M:%S'
         )
-        file_handler.setFormatter(formatter)
-        console_handler.setFormatter(formatter)
         
-        self.logger.addHandler(file_handler)
+        # Main log file (INFO, WARNING, ERROR, CRITICAL)
+        main_log_file = self.log_dir / f"weather_{date_str}.log"
+        main_file_handler = logging.FileHandler(main_log_file, encoding='utf-8')
+        main_file_handler.setLevel(logging.INFO)  # INFO and above
+        main_file_handler.addFilter(LevelFilter([logging.INFO, logging.WARNING, logging.ERROR, logging.CRITICAL]))
+        main_file_handler.setFormatter(formatter)
+        self.logger.addHandler(main_file_handler)
+        
+        # Error log file (ERROR and CRITICAL only)
+        error_log_file = self.log_dir / f"weather_error_{date_str}.log"
+        error_file_handler = logging.FileHandler(error_log_file, encoding='utf-8')
+        error_file_handler.setLevel(logging.ERROR)  # ERROR and above
+        error_file_handler.addFilter(LevelFilter([logging.ERROR, logging.CRITICAL]))
+        error_file_handler.setFormatter(formatter)
+        self.logger.addHandler(error_file_handler)
+        
+        # Debug log file (DEBUG only)
+        debug_log_file = self.log_dir / f"weather_debug_{date_str}.log"
+        debug_file_handler = logging.FileHandler(debug_log_file, encoding='utf-8')
+        debug_file_handler.setLevel(logging.DEBUG)  # DEBUG and above
+        debug_file_handler.addFilter(LevelFilter([logging.DEBUG]))
+        debug_file_handler.setFormatter(formatter)
+        self.logger.addHandler(debug_file_handler)
+        
+        # Console handler (all levels)
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(log_level)
+        console_handler.setFormatter(formatter)
         self.logger.addHandler(console_handler)
         
         # Store log messages for GUI

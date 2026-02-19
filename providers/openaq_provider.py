@@ -418,9 +418,19 @@ class OpenAQProvider(WeatherProvider):
                             if sensor_id not in sensor_param_cache:
                                 # Check persistent cache first
                                 if sensor_id in self._sensor_cache:
-                                    sensor_param_cache[sensor_id] = self._sensor_cache[sensor_id]
+                                    cached_value = self._sensor_cache[sensor_id]
+                                    # Handle backward compatibility: old cache might have just ID
+                                    if isinstance(cached_value, tuple):
+                                        sensor_param_cache[sensor_id] = cached_value
+                                    else:
+                                        # Old format: just ID, convert to tuple with None name
+                                        sensor_param_cache[sensor_id] = (cached_value, None)
                                     if self.logger:
-                                        self.logger.debug(f"OpenAQ: Använder cached parameterId {self._sensor_cache[sensor_id]} för sensor {sensor_id}")
+                                        if isinstance(cached_value, tuple):
+                                            name_str = f" (name: {cached_value[1]})" if cached_value[1] else ""
+                                            self.logger.debug(f"OpenAQ: Använder cached parameterId {cached_value[0]}{name_str} för sensor {sensor_id}")
+                                        else:
+                                            self.logger.debug(f"OpenAQ: Använder cached parameterId {cached_value} för sensor {sensor_id}")
                                 else:
                                     try:
                                         # Check rate limits before making request
@@ -451,6 +461,7 @@ class OpenAQProvider(WeatherProvider):
                                             # Sensor response structure: {"results": [{"parameter": {"id": 2, "name": "pm25"}, ...}]}
                                             # OR: {"parameter": {"id": 2, ...}} (direct)
                                             param_id = None
+                                            param_name = None
                                             if "results" in sensor_data and len(sensor_data["results"]) > 0:
                                                 # Array response
                                                 sensor_obj = sensor_data["results"][0]
@@ -458,6 +469,7 @@ class OpenAQProvider(WeatherProvider):
                                                     param_obj = sensor_obj["parameter"]
                                                     if isinstance(param_obj, dict):
                                                         param_id = param_obj.get("id")
+                                                        param_name = param_obj.get("name")  # Extract parameter name
                                                     else:
                                                         param_id = param_obj
                                             elif "parameter" in sensor_data:
@@ -465,6 +477,7 @@ class OpenAQProvider(WeatherProvider):
                                                 param_obj = sensor_data["parameter"]
                                                 if isinstance(param_obj, dict):
                                                     param_id = param_obj.get("id")
+                                                    param_name = param_obj.get("name")  # Extract parameter name
                                                 else:
                                                     param_id = param_obj
                                             
@@ -473,11 +486,13 @@ class OpenAQProvider(WeatherProvider):
                                                 param_id = sensor_data.get("parameterId") or sensor_data.get("parameter")
                                             
                                             if param_id:
-                                                sensor_param_cache[sensor_id] = param_id
-                                                # Cache for future requests
-                                                self._sensor_cache[sensor_id] = param_id
+                                                # Store both ID and name in cache (as tuple)
+                                                sensor_param_cache[sensor_id] = (param_id, param_name)
+                                                # Cache for future requests (store as tuple)
+                                                self._sensor_cache[sensor_id] = (param_id, param_name)
                                                 if self.logger:
-                                                    self.logger.debug(f"OpenAQ: Sensor {sensor_id} har parameterId {param_id} (cached)")
+                                                    name_str = f" (name: {param_name})" if param_name else ""
+                                                    self.logger.debug(f"OpenAQ: Sensor {sensor_id} har parameterId {param_id}{name_str} (cached)")
                                         else:
                                             if self.logger:
                                                 self.logger.info(f"OpenAQ: Kunde inte hämta sensor {sensor_id} info (status {sensor_response.status_code})")
@@ -488,12 +503,20 @@ class OpenAQProvider(WeatherProvider):
                             
                             # If we have parameterId, create measurement object
                             if sensor_id in sensor_param_cache:
-                                param_id = sensor_param_cache[sensor_id]
+                                # Cache stores (param_id, param_name) tuple
+                                cache_value = sensor_param_cache[sensor_id]
+                                if isinstance(cache_value, tuple):
+                                    param_id, param_name = cache_value
+                                else:
+                                    # Backward compatibility: if cache has old format (just ID)
+                                    param_id = cache_value
+                                    param_name = None
+                                
                                 measurement = {
                                     "sensorId": sensor_id,  # Include sensor_id for sensor data collection
                                     "sensorsId": sensor_id,  # Also include as sensorsId for compatibility
                                     "parameterId": param_id,
-                                    "parameter": param_id,  # Use ID as parameter name too
+                                    "parameter": param_name if param_name else param_id,  # Use parameter name, fallback to ID
                                     "value": value
                                 }
                                 measurements.append(measurement)

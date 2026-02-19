@@ -2,12 +2,15 @@
 
 import json
 from typing import List, Dict, Optional
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
     QDialog, QFormLayout, QLineEdit, QDialogButtonBox, QMessageBox
 )
 from PyQt5.QtCore import Qt, QUrl
 import logging
+from utils.parameter_formatter import format_parameter_name
 
 # Try to import QWebEngineView (optional dependency)
 try:
@@ -162,6 +165,46 @@ class StationsTab(QWidget):
             logger.error(f"Fel vid hämtning av sensorer: {e}")
             return []
     
+    def _format_timestamp(self, timestamp) -> str:
+        """
+        Format timestamp to readable format.
+        
+        Args:
+            timestamp: datetime object or string or None
+            
+        Returns:
+            Formatted timestamp string or "Okänd"
+        """
+        if timestamp is None:
+            return "Okänd"
+        
+        try:
+            # Handle string timestamps
+            if isinstance(timestamp, str):
+                # Try to parse common formats
+                for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S"]:
+                    try:
+                        dt = datetime.strptime(timestamp, fmt)
+                        # Ensure timezone-aware (CET)
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=ZoneInfo("Europe/Stockholm"))
+                        return dt.strftime("%Y-%m-%d %H:%M")
+                    except ValueError:
+                        continue
+                return timestamp  # Return as-is if can't parse
+            elif isinstance(timestamp, datetime):
+                # Ensure timezone-aware (CET)
+                if timestamp.tzinfo is None:
+                    timestamp = timestamp.replace(tzinfo=ZoneInfo("Europe/Stockholm"))
+                elif timestamp.tzinfo != ZoneInfo("Europe/Stockholm"):
+                    timestamp = timestamp.astimezone(ZoneInfo("Europe/Stockholm"))
+                return timestamp.strftime("%Y-%m-%d %H:%M")
+            else:
+                return str(timestamp)
+        except Exception as e:
+            logger.warning(f"Fel vid formatering av timestamp: {e}")
+            return "Okänd"
+    
     def _generate_map_html(self, sensors: List[Dict]) -> str:
         """
         Generate HTML with Leaflet map.
@@ -172,8 +215,27 @@ class StationsTab(QWidget):
         Returns:
             HTML string
         """
+        # Format sensors before JSON serialization
+        formatted_sensors = []
+        for sensor in sensors:
+            formatted_sensor = sensor.copy()
+            
+            # Format parameter name if it exists
+            if 'parameter' in formatted_sensor and formatted_sensor['parameter']:
+                formatted_sensor['formatted_parameter'] = format_parameter_name(formatted_sensor['parameter'])
+            else:
+                formatted_sensor['formatted_parameter'] = "Okänd"
+            
+            # Format timestamp
+            if 'last_updated' in formatted_sensor:
+                formatted_sensor['formatted_timestamp'] = self._format_timestamp(formatted_sensor['last_updated'])
+            else:
+                formatted_sensor['formatted_timestamp'] = "Okänd"
+            
+            formatted_sensors.append(formatted_sensor)
+        
         # Convert sensors to JSON
-        sensors_json = json.dumps(sensors, default=str)
+        sensors_json = json.dumps(formatted_sensors, default=str)
         
         # Calculate center and bounds from sensors
         if sensors:
@@ -242,12 +304,16 @@ class StationsTab(QWidget):
                 }}
             }} else {{
                 // OpenAQ sensor
-                popupContent += '<b>' + (sensor.parameter || 'Sensor') + '</b><br>';
+                popupContent += '<b>Sensor ID:</b> ' + (sensor.sensor_id || 'Okänd') + '<br>';
+                popupContent += '<b>Parameter:</b> ' + (sensor.formatted_parameter || sensor.parameter || 'Okänd') + '<br>';
                 if (sensor.last_value != null) {{
-                    popupContent += 'Värde: ' + sensor.last_value + ' µg/m³<br>';
+                    popupContent += '<b>Värde:</b> ' + sensor.last_value + ' µg/m³<br>';
+                }}
+                if (sensor.formatted_timestamp && sensor.formatted_timestamp !== 'Okänd') {{
+                    popupContent += '<b>Uppdaterad:</b> ' + sensor.formatted_timestamp + '<br>';
                 }}
                 if (sensor.city_name) {{
-                    popupContent += 'Stad: ' + sensor.city_name + '<br>';
+                    popupContent += '<b>Stad:</b> ' + sensor.city_name + '<br>';
                 }}
             }}
             

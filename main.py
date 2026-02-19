@@ -49,17 +49,10 @@ def main():
         window = MainWindow(controller)
         logger.info("Huvudfönster skapat")
         
-        # Connect scheduler to window refresh
-        def refresh_on_update():
-            """Safely refresh GUI from main thread."""
-            try:
-                logger.debug("Uppdaterar GUI efter scheduler trigger")
-                window.refresh_all()
-            except Exception as e:
-                logger.error(f"Fel vid GUI-uppdatering: {e}")
-        
-        scheduler.update_triggered.connect(refresh_on_update)
-        logger.info("Scheduler kopplad till GUI refresh")
+        # Note: UI refresh is now event-driven via controller.data_updated signal
+        # The scheduler's update_triggered signal is not connected to refresh
+        # because we only want to refresh when data is actually saved, not when update starts
+        logger.info("UI refresh är event-driven (endast vid faktisk datainsättning)")
         
         # Add scheduler methods to controller for GUI access
         controller.start_auto_update = scheduler.start
@@ -68,8 +61,8 @@ def main():
             """Safely trigger manual update."""
             try:
                 controller.update_all_cities()
-                # Refresh GUI after a short delay to let data update
-                QTimer.singleShot(500, window.refresh_all)
+                # UI will refresh automatically via data_updated signal when data is saved
+                # No need for timer-based refresh - event-driven is better
             except Exception as e:
                 logger.error(f"Fel vid manuell uppdatering: {e}")
         

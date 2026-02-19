@@ -2,6 +2,7 @@
 
 import threading
 from typing import List, Dict, Optional
+from PyQt5.QtCore import QObject, pyqtSignal
 from database.db_manager import DatabaseManager
 from utils.config_loader import ConfigLoader
 from utils.logger import WeatherLogger
@@ -9,13 +10,19 @@ from providers.openmeteo_provider import OpenMeteoProvider
 from providers.openweather_provider import OpenWeatherProvider
 from providers.openaq_provider import OpenAQProvider
 from analytics.analyzer import WeatherAnalyzer
+from utils.parameter_formatter import format_parameter_name
 
 
-class WeatherController:
+class WeatherController(QObject):
     """Main controller connecting GUI, providers, database and analytics."""
+    
+    # Signal emitted when new data is saved to database
+    # Parameters: (city_id: int, data_id: int)
+    data_updated = pyqtSignal(int, int)
     
     def __init__(self):
         """Initialize controller."""
+        super().__init__()  # Initialize QObject
         # Load configuration
         self.config = ConfigLoader()
         
@@ -322,27 +329,15 @@ class WeatherController:
                                                 value = sensor.get("value")
                                                 
                                                 if sensor_id and sensor_lat is not None and sensor_lon is not None:
-                                                    # Map parameter ID or name to standard format
-                                                    # Parameter IDs: 2=PM2.5, 1=PM10, 5=NO2, 3=O3
-                                                    param_id_map = {
-                                                        2: "PM2.5",
-                                                        1: "PM10",
-                                                        5: "NO2",
-                                                        3: "O3"
-                                                    }
-                                                    param_name_map = {
-                                                        "pm2.5": "PM2.5",
-                                                        "pm25": "PM2.5",
-                                                        "pm10": "PM10",
-                                                        "no2": "NO2",
-                                                        "o3": "O3"
-                                                    }
-                                                    
-                                                    # Try parameter ID first, then parameter name
+                                                    # Format parameter name dynamically (no hardcoded IDs)
+                                                    # Parameter can be int (ID) or string (name) from API
                                                     if isinstance(parameter, int):
-                                                        param_name = param_id_map.get(parameter, f"Parameter_{parameter}")
+                                                        # If parameter is an ID, we can't format it without name
+                                                        # Use the parameter value as-is and let formatter handle it
+                                                        param_name = format_parameter_name(str(parameter))
                                                     else:
-                                                        param_name = param_name_map.get(str(parameter).lower(), str(parameter))
+                                                        # Parameter is already a name string from API
+                                                        param_name = format_parameter_name(str(parameter))
                                                     
                                                     self.db.add_sensor(
                                                         city_id=city_id,
@@ -395,25 +390,15 @@ class WeatherController:
                                             value = sensor.get("value")
                                             
                                             if sensor_id and sensor_lat is not None and sensor_lon is not None:
-                                                # Map parameter ID or name to standard format
-                                                param_id_map = {
-                                                    2: "PM2.5",
-                                                    1: "PM10",
-                                                    5: "NO2",
-                                                    3: "O3"
-                                                }
-                                                param_name_map = {
-                                                    "pm2.5": "PM2.5",
-                                                    "pm25": "PM2.5",
-                                                    "pm10": "PM10",
-                                                    "no2": "NO2",
-                                                    "o3": "O3"
-                                                }
-                                                
+                                                # Format parameter name dynamically (no hardcoded IDs)
+                                                # Parameter can be int (ID) or string (name) from API
                                                 if isinstance(parameter, int):
-                                                    param_name = param_id_map.get(parameter, f"Parameter_{parameter}")
+                                                    # If parameter is an ID, we can't format it without name
+                                                    # Use the parameter value as-is and let formatter handle it
+                                                    param_name = format_parameter_name(str(parameter))
                                                 else:
-                                                    param_name = param_name_map.get(str(parameter).lower(), str(parameter))
+                                                    # Parameter is already a name string from API
+                                                    param_name = format_parameter_name(str(parameter))
                                                 
                                                 self.db.add_sensor(
                                                     city_id=city_id,
@@ -517,10 +502,11 @@ class WeatherController:
                 # Save weather data (always save, use collector timestamp)
                 self.logger.debug(f"Sparar väderdata för {city_name} till databas...")
                 try:
+                    data_id = None
                     # Save weather data with pollutants only if timestamp is new
                     if should_save_pollutants:
                         # Save with measurement timestamp if available, otherwise collector timestamp
-                        self.db.add_weather_data(
+                        data_id = self.db.add_weather_data(
                             city_id=city_id,
                             temperature=float(temp),
                             humidity=float(humidity),
@@ -534,7 +520,7 @@ class WeatherController:
                         )
                     else:
                         # Save only weather data (no pollutants) with collector timestamp
-                        self.db.add_weather_data(
+                        data_id = self.db.add_weather_data(
                             city_id=city_id,
                             temperature=float(temp),
                             humidity=float(humidity),
@@ -545,6 +531,11 @@ class WeatherController:
                             o3=None,
                             source=str(source)
                         )
+                    
+                    # Emit signal if data was successfully saved (data_id > 0)
+                    if data_id and data_id > 0:
+                        self.logger.debug(f"Ny data sparad för {city_name} (ID: {data_id}), emitterar signal")
+                        self.data_updated.emit(city_id, data_id)
                     
                     # Log saved pollutants
                     poll_display = []
