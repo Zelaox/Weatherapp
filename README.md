@@ -90,6 +90,7 @@ pip install -r requirements.txt
 
 Detta installerar:
 - PyQt5 (GUI)
+- PyQtWebEngine (för interaktiv karta i Stationer-fliken)
 - requests (API-anrop)
 - matplotlib (grafer)
 - pandas (datahantering)
@@ -97,10 +98,7 @@ Detta installerar:
 - numpy (numeriska beräkningar)
 - zoneinfo (tidszoner)
 
-**Valfritt beroende:**
-- PyQtWebEngine (för interaktiv karta i Stationer-fliken)
-  - Installera med: `pip install PyQtWebEngine`
-  - Om inte installerat: Applikationen fungerar normalt, men kartan i Stationer-fliken visas inte
+**OBS:** PyQtWebEngine är nu ett krav för att kartan ska fungera. Om installationen misslyckas, se felsökningssektionen nedan.
 
 ### Konfiguration
 
