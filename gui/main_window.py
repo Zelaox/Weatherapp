@@ -16,6 +16,7 @@ from gui.warnings_tab import WarningsTab
 from gui.api_status_tab import APIStatusTab
 from gui.logs_tab import LogsTab
 from gui.stations_tab import StationsTab
+from gui.help_dialog import HelpDialog
 from analytics.graph_generator import GraphGenerator
 from analytics.graph_modes import MODES, BaseMode
 from zoneinfo import ZoneInfo
@@ -203,6 +204,8 @@ class MainWindow(QMainWindow):
     def _create_menubar(self):
         """Create menubar with Generate menu built dynamically from MODES."""
         menubar = self.menuBar()
+        
+        # Generate menu
         generate_menu = menubar.addMenu("Generera")
         
         # Dynamisk byggnad från MODES dictionary
@@ -210,6 +213,12 @@ class MainWindow(QMainWindow):
             action = QAction(mode_name, self)
             action.triggered.connect(lambda checked, m=mode_class: self.run_mode(m))
             generate_menu.addAction(action)
+        
+        # Help menu
+        help_menu = menubar.addMenu("Hjälp")
+        help_action = QAction("Funktioner och Hjälp", self)
+        help_action.triggered.connect(self._show_help_dialog)
+        help_menu.addAction(help_action)
     
     def _toggle_auto_update(self, checked: bool):
         """Toggle auto-update on/off."""
@@ -226,6 +235,11 @@ class MainWindow(QMainWindow):
         else:
             self.controller.update_all_cities()
         self.refresh_all()
+    
+    def _show_help_dialog(self):
+        """Show help dialog with feature dictionary."""
+        dialog = HelpDialog(self)
+        dialog.exec_()
     
     def _on_city_selected(self, city_id: int):
         """Handle city selection."""
