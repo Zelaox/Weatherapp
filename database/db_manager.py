@@ -134,6 +134,75 @@ class DatabaseManager:
                     logger.info("Migration klar: sensors-tabell tillagd")
                 else:
                     logger.warning(f"Migration file not found: {migration_path}")
+            
+            # Check if sensor_readings table exists and sensors table has new columns
+            if self.has_sensors_table():
+                cursor.execute("PRAGMA table_info(sensors)")
+                sensor_columns = [row[1] for row in cursor.fetchall()]
+                
+                # Check if sensor_readings table exists
+                cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='sensor_readings'")
+                has_readings_table = cursor.fetchone() is not None
+                
+                # Run sensor engine migration if needed
+                if 'provider_type' not in sensor_columns or not has_readings_table:
+                    logger.info("Kör migration för sensor engine...")
+                    migration_path = Path(__file__).parent / "migration_sensor_engine.sql"
+                    if migration_path.exists():
+                        # Add columns one by one with error handling
+                        # Note: SQLite doesn't support DEFAULT CURRENT_TIMESTAMP in ALTER TABLE
+                        # We add columns without DEFAULT, then UPDATE existing rows
+                        columns_to_add = [
+                            ('provider_type', 'TEXT', None),
+                            ('config_json', 'TEXT', None),
+                            ('visibility_mode', 'TEXT', "'marker'"),
+                            ('enabled', 'INTEGER', '1'),
+                            ('interval_seconds', 'INTEGER', '600'),
+                            ('last_error', 'TEXT', None),
+                            ('error_count', 'INTEGER', '0'),
+                            ('created_at', 'DATETIME', None)  # Will be set via UPDATE
+                        ]
+                        
+                        for col_name, col_type, default_value in columns_to_add:
+                            if col_name not in sensor_columns:
+                                try:
+                                    # Add column without DEFAULT (SQLite limitation)
+                                    cursor.execute(f"ALTER TABLE sensors ADD COLUMN {col_name} {col_type}")
+                                    logger.debug(f"Lade till kolumn {col_name}")
+                                    
+                                    # Set default value for existing rows if specified
+                                    if default_value is not None:
+                                        cursor.execute(f"UPDATE sensors SET {col_name} = {default_value} WHERE {col_name} IS NULL")
+                                    elif col_name == 'created_at':
+                                        # Special case: set created_at to CURRENT_TIMESTAMP for existing rows
+                                        cursor.execute(f"UPDATE sensors SET {col_name} = CURRENT_TIMESTAMP WHERE {col_name} IS NULL")
+                                except sqlite3.OperationalError as e:
+                                    if "duplicate column name" not in str(e).lower():
+                                        logger.warning(f"Kunde inte lägga till kolumn {col_name}: {e}")
+                        
+                        # Create sensor_readings table if it doesn't exist
+                        if not has_readings_table:
+                            try:
+                                cursor.execute("""
+                                    CREATE TABLE IF NOT EXISTS sensor_readings (
+                                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                        sensor_id INTEGER NOT NULL,
+                                        value REAL NOT NULL,
+                                        parameter TEXT,
+                                        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                                        FOREIGN KEY (sensor_id) REFERENCES sensors(id) ON DELETE CASCADE
+                                    )
+                                """)
+                                cursor.execute("CREATE INDEX IF NOT EXISTS idx_sensor_readings_sensor_timestamp ON sensor_readings(sensor_id, timestamp)")
+                                cursor.execute("CREATE INDEX IF NOT EXISTS idx_sensor_readings_timestamp ON sensor_readings(timestamp)")
+                                logger.info("sensor_readings tabell skapad")
+                            except Exception as e:
+                                logger.warning(f"Kunde inte skapa sensor_readings tabell: {e}")
+                        
+                        conn.commit()
+                        logger.info("Migration klar: sensor engine schema uppdaterat")
+                    else:
+                        logger.warning(f"Migration file not found: {migration_path}")
         except Exception as e:
             logger.error(f"Fel vid migration: {e}")
             # Don't raise - migration is optional, schema might already be updated
@@ -884,6 +953,172 @@ class DatabaseManager:
             is_custom=1,
             custom_info=custom_info
         )
+    
+    # Sensor readings operations (for new sensor engine)
+    def add_sensor_reading(self, sensor_id: int, value: float, parameter: str, timestamp: datetime) -> int:
+        """
+        Add a sensor reading to sensor_readings table.
+        
+        Args:
+            sensor_id: Sensor ID
+            value: Reading value
+            parameter: Parameter name
+            timestamp: Reading timestamp
+            
+        Returns:
+            Reading ID
+        """
+        try:
+            with _write_lock:
+                conn = self._get_connection()
+                cursor = conn.cursor()
+                cursor.execute(
+                    """INSERT INTO sensor_readings (sensor_id, value, parameter, timestamp)
+                       VALUES (?, ?, ?, ?)""",
+                    (sensor_id, value, parameter, timestamp)
+                )
+                conn.commit()
+                return cursor.lastrowid
+        except Exception as e:
+            logger.error(f"Error adding sensor reading: {e}")
+            raise
+    
+    def batch_add_sensor_readings(self, readings: List[Dict]):
+        """
+        Batch insert sensor readings.
+        
+        Args:
+            readings: List of dicts with keys: sensor_id, value, parameter, timestamp
+        """
+        if not readings:
+            return
+        
+        try:
+            with _write_lock:
+                conn = self._get_connection()
+                cursor = conn.cursor()
+                cursor.executemany(
+                    """INSERT INTO sensor_readings (sensor_id, value, parameter, timestamp)
+                       VALUES (?, ?, ?, ?)""",
+                    [
+                        (r['sensor_id'], r['value'], r['parameter'], r['timestamp'])
+                        for r in readings
+                    ]
+                )
+                conn.commit()
+                logger.debug(f"Batch inserted {len(readings)} sensor readings")
+        except Exception as e:
+            logger.error(f"Error batch adding sensor readings: {e}")
+            raise
+    
+    def update_sensor_last_value(self, sensor_id: int, value: float, timestamp: datetime):
+        """
+        Update sensor last_value and last_updated.
+        
+        Args:
+            sensor_id: Sensor ID
+            value: New value
+            timestamp: Update timestamp
+        """
+        try:
+            with _write_lock:
+                conn = self._get_connection()
+                cursor = conn.cursor()
+                cursor.execute(
+                    """UPDATE sensors 
+                       SET last_value = ?, last_updated = ?
+                       WHERE id = ?""",
+                    (value, timestamp, sensor_id)
+                )
+                conn.commit()
+        except Exception as e:
+            logger.error(f"Error updating sensor last value: {e}")
+            raise
+    
+    def batch_update_sensor_last_values(self, updates: List[Dict]):
+        """
+        Batch update sensor last values.
+        
+        Args:
+            updates: List of dicts with keys: sensor_id, last_value, last_updated
+        """
+        if not updates:
+            return
+        
+        try:
+            with _write_lock:
+                conn = self._get_connection()
+                cursor = conn.cursor()
+                for update in updates:
+                    cursor.execute(
+                        """UPDATE sensors 
+                           SET last_value = ?, last_updated = ?
+                           WHERE id = ?""",
+                        (update['last_value'], update['last_updated'], update['sensor_id'])
+                    )
+                conn.commit()
+                logger.debug(f"Batch updated {len(updates)} sensor last values")
+        except Exception as e:
+            logger.error(f"Error batch updating sensor last values: {e}")
+            raise
+    
+    def get_sensor_readings(self, sensor_id: int, hours: Optional[int] = None) -> List[Dict]:
+        """
+        Get sensor readings for a sensor.
+        
+        Args:
+            sensor_id: Sensor ID
+            hours: Optional hours to filter (None = all readings)
+            
+        Returns:
+            List of reading dicts
+        """
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            
+            if hours is None:
+                cursor.execute(
+                    """SELECT * FROM sensor_readings 
+                       WHERE sensor_id = ? 
+                       ORDER BY timestamp ASC""",
+                    (sensor_id,)
+                )
+            else:
+                cutoff_time = datetime.now(CET) - timedelta(hours=hours)
+                cutoff_str = cutoff_time.strftime('%Y-%m-%d %H:%M:%S')
+                cursor.execute(
+                    """SELECT * FROM sensor_readings 
+                       WHERE sensor_id = ? AND timestamp >= ?
+                       ORDER BY timestamp ASC""",
+                    (sensor_id, cutoff_str)
+                )
+            
+            return [dict(row) for row in cursor.fetchall()]
+        except Exception as e:
+            logger.error(f"Error getting sensor readings: {e}")
+            return []
+    
+    def get_latest_sensor_readings(self) -> List[Dict]:
+        """
+        Get latest readings for all sensors (for heatmap).
+        
+        Returns:
+            List of dicts with sensor_id, latitude, longitude, last_value
+        """
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            cursor.execute(
+                """SELECT s.id as sensor_id, s.latitude, s.longitude, s.last_value
+                   FROM sensors s
+                   WHERE s.enabled = 1 AND s.visibility_mode = 'heatmap' AND s.last_value IS NOT NULL
+                   ORDER BY s.id"""
+            )
+            return [dict(row) for row in cursor.fetchall()]
+        except Exception as e:
+            logger.error(f"Error getting latest sensor readings: {e}")
+            return []
     
     def delete_sensor(self, sensor_db_id: int) -> bool:
         """
