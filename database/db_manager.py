@@ -511,19 +511,63 @@ class DatabaseManager:
     def get_latest_pollutant_values(self, city_id: int) -> Optional[Dict]:
         """
         Get latest pollutant values for a city.
+        Dynamically discovers pollutant parameters from schema (no hardcoding).
         
         Args:
             city_id: City ID
             
         Returns:
-            Dictionary with pm25, pm10, no2, o3 values, or None if no data
+            Dictionary with pollutant values (dynamically discovered), or None if no data
         """
+        try:
+            # Discover pollutant parameters from schema dynamically
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA table_info(weather_data)")
+            columns = [row[1] for row in cursor.fetchall()]
+            # Exclude non-pollutant columns
+            excluded = {'id', 'city_id', 'timestamp', 'source', 'aqi', 'measurement_timestamp', 
+                       'temperature', 'humidity', 'wind_speed'}
+            pollutant_params = [col for col in columns if col not in excluded]
+            
+            if not pollutant_params:
+                return None
+            
+            # Build dynamic SQL query
+            # Create condition: at least one pollutant is NOT NULL
+            not_null_conditions = " OR ".join([f"{param} IS NOT NULL" for param in pollutant_params])
+            select_clause = ", ".join(pollutant_params)
+            
+            query = f"""SELECT {select_clause}
+                       FROM weather_data 
+                       WHERE city_id = ? 
+                       AND ({not_null_conditions})
+                       ORDER BY timestamp DESC 
+                       LIMIT 1"""
+            
+            cursor.execute(query, (city_id,))
+            row = cursor.fetchone()
+            if row:
+                # Return dict with all pollutant values (dynamically discovered)
+                return {param: row[param] for param in pollutant_params}
+            return None
+        except Exception as e:
+            logger.warning(f"Fel vid hämtning av senaste pollutant-värden: {e}")
+            return None
+    
+    def get_latest_weather(self, city_id: int) -> Optional[Dict]:
+        """
+        Get latest weather data for a city.
+        Prefers rows with pollutant data if available.
+        """
+        # No logger to avoid recursion - this is called frequently from GUI
         try:
             conn = self._get_connection()
             cursor = conn.cursor()
+            
+            # First try to get latest row with any pollutant data
             cursor.execute(
-                """SELECT pm25, pm10, no2, o3 
-                   FROM weather_data 
+                """SELECT * FROM weather_data 
                    WHERE city_id = ? 
                    AND (pm25 IS NOT NULL OR pm10 IS NOT NULL OR no2 IS NOT NULL OR o3 IS NOT NULL)
                    ORDER BY timestamp DESC 
@@ -531,32 +575,18 @@ class DatabaseManager:
                 (city_id,)
             )
             row = cursor.fetchone()
-            if row:
-                return {
-                    'pm25': row['pm25'],
-                    'pm10': row['pm10'],
-                    'no2': row['no2'],
-                    'o3': row['o3']
-                }
-            return None
-        except Exception as e:
-            logger.warning(f"Fel vid hämtning av senaste pollutant-värden: {e}")
-            return None
-    
-    def get_latest_weather(self, city_id: int) -> Optional[Dict]:
-        """Get latest weather data for a city."""
-        # No logger to avoid recursion - this is called frequently from GUI
-        try:
-            conn = self._get_connection()
-            cursor = conn.cursor()
-            cursor.execute(
-                """SELECT * FROM weather_data 
-                   WHERE city_id = ? 
-                   ORDER BY timestamp DESC 
-                   LIMIT 1""",
-                (city_id,)
-            )
-            row = cursor.fetchone()
+            
+            # If no row with pollutants, get latest row regardless
+            if not row:
+                cursor.execute(
+                    """SELECT * FROM weather_data 
+                       WHERE city_id = ? 
+                       ORDER BY timestamp DESC 
+                       LIMIT 1""",
+                    (city_id,)
+                )
+                row = cursor.fetchone()
+            
             return dict(row) if row else None
         except Exception:
             # Return None on error instead of raising
@@ -1141,6 +1171,127 @@ class DatabaseManager:
             logger.warning(f"Fel vid borttagning av sensor {sensor_db_id}: {e}")
             return False
     
+    # Map analytics queries
+    def get_cities_with_weather_for_map(self) -> List[Dict]:
+        """
+        Single JOIN query returning the latest weather row per city for map rendering.
+
+        Returns:
+            List of dicts: city_id, city_name, latitude, longitude,
+                           temperature, humidity, wind_speed, pm25, no2, o3
+            Empty list if no data found.
+        """
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            cursor.execute(
+                """SELECT c.id AS city_id,
+                          c.name AS city_name,
+                          c.latitude,
+                          c.longitude,
+                          wd.temperature,
+                          wd.humidity,
+                          wd.wind_speed,
+                          wd.pm25,
+                          wd.no2,
+                          wd.o3
+                   FROM cities c
+                   INNER JOIN weather_data wd ON wd.city_id = c.id
+                   INNER JOIN (
+                       SELECT city_id, MAX(timestamp) AS max_ts
+                       FROM weather_data
+                       GROUP BY city_id
+                   ) latest ON wd.city_id = latest.city_id
+                          AND wd.timestamp = latest.max_ts
+                   ORDER BY c.name"""
+            )
+            return [dict(row) for row in cursor.fetchall()]
+        except Exception as e:
+            logger.warning(f"Fel vid get_cities_with_weather_for_map: {e}")
+            return []
+
+    def get_national_pm25_7day_average(self) -> Optional[float]:
+        """
+        Compute the mean PM2.5 across all cities over the last 168 hours.
+
+        Returns:
+            Mean PM2.5 as float, or None if no data exists.
+        """
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            cursor.execute(
+                """SELECT AVG(pm25) AS mean_pm25
+                   FROM weather_data
+                   WHERE pm25 IS NOT NULL
+                     AND timestamp > datetime('now', '-168 hours')"""
+            )
+            row = cursor.fetchone()
+            if row and row["mean_pm25"] is not None:
+                return float(row["mean_pm25"])
+            return None
+        except Exception as e:
+            logger.warning(f"Fel vid get_national_pm25_7day_average: {e}")
+            return None
+
+    def get_parameter_winsorized_bounds(
+        self, parameter: str, p_low: int, p_high: int
+    ) -> Tuple[Optional[float], Optional[float]]:
+        """
+        Return winsorized (percentile-based) bounds for a weather_data column.
+
+        Fetches the full sorted history for the parameter and computes the
+        p_low-th and p_high-th percentile in Python.  A single outlier sensor
+        cannot corrupt these bounds as long as it represents less than
+        (100 - p_high) percent of all readings.
+
+        Args:
+            parameter: Column name in weather_data (e.g. 'wind_speed', 'humidity').
+                       Only whitelisted column names are accepted.
+            p_low:     Lower percentile (0–100).
+            p_high:    Upper percentile (0–100).
+
+        Returns:
+            (lower_bound, upper_bound) as floats, or (None, None) if fewer
+            than 20 non-null rows exist for the parameter.
+        """
+        ALLOWED_PARAMETERS = {
+            "wind_speed", "humidity", "temperature", "pm25", "pm10", "no2", "o3", "aqi"
+        }
+        if parameter not in ALLOWED_PARAMETERS:
+            logger.error(
+                f"get_parameter_winsorized_bounds: parameter '{parameter}' not allowed"
+            )
+            return None, None
+
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            # Fetch full sorted history — column name is safe because of whitelist above
+            cursor.execute(
+                f"SELECT {parameter} FROM weather_data "
+                f"WHERE {parameter} IS NOT NULL "
+                f"ORDER BY {parameter} ASC"
+            )
+            rows = [row[0] for row in cursor.fetchall()]
+
+            if len(rows) < 20:
+                logger.info(
+                    f"get_parameter_winsorized_bounds: insufficient history for "
+                    f"'{parameter}' ({len(rows)} rows, need ≥ 20)"
+                )
+                return None, None
+
+            n = len(rows)
+            lo_idx = max(0, int(round(p_low  / 100 * (n - 1))))
+            hi_idx = min(n - 1, int(round(p_high / 100 * (n - 1))))
+            return float(rows[lo_idx]), float(rows[hi_idx])
+        except Exception as e:
+            logger.warning(
+                f"Fel vid get_parameter_winsorized_bounds('{parameter}'): {e}"
+            )
+            return None, None
+
     # Cleanup operations
     def cleanup_old_data(self, days: int):
         """Delete weather data older than specified days."""
