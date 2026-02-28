@@ -28,12 +28,16 @@ En produktionsklar väderapplikation byggd med PyQt5 som samlar väderdata och l
 - **Automatisk geokodning** av stadsnamn
 - **Lägg till/ta bort städer** dynamiskt
 
-### 📍 Stationer och Sensorer
-- **Interaktiv karta**: Visa alla OpenAQ-stationer och sensorer på en Leaflet-karta
-- **Sensor-information**: Se sensor-ID, parameter, senaste värde och koordinater
-- **Custom markers**: Lägg till egna sensorer/markörer på kartan
-- **Google Maps-integration**: Direktlänkar till sensorer i Google Maps
-- **PyQtWebEngine**: Valfritt beroende (applikationen fungerar utan, men karta kräver det)
+### 📍 Analytisk Karta och Stationer
+- **Interaktiv Leaflet-karta** med tre lager: Stationer, Heatmap, Sensorer
+- **Färgkodade AQI-markörer**: Cirkelmarkörer färgas dynamiskt via `WarningDetector`, yttre grå ring = vindhastighet
+- **Täthetsmedveten heatmap**: Interpoleringsradien anpassas per station; glesbebyggda områden märks med varningsbadge
+- **Analytiska popups**: 24h PM2.5-sparkline (inline SVG), inversionsriskpoäng 0–100 med mätarbar, kalibrerings-metadata
+- **Regional klusteranalys**: Identifierar regional PM2.5-påverkan relativt nationellt 7-dagarsmedelvärde; banner visas på kartan
+- **Inversionsriskmodell v3**: Probabilistisk poäng, winsoriserade p5/p95-gränser, temporalt stabil, null-safe
+- **Custom markers**: Högerklicka på kartan för att lägga till egna markörer (sparas i databasen)
+- **Debug-läge**: Exponerar råvärden, normaliserade värden, `deviation_factor` och `inversion_model_version` i popupsen
+- **PyQtWebEngine**: Krävs för kartan (`pip install PyQtWebEngine`)
 
 ## Teknisk Arkitektur
 
@@ -118,7 +122,8 @@ OPENAQ_API_KEY=din_faktiska_openaq_nyckel
 **VIKTIGT:** `.env` filen är redan i `.gitignore` och kommer INTE att laddas upp till GitHub.
 
 #### Steg 3: (Valfritt) config.json som fallback
-Om du föredrar att använda `config.json` istället för `.env`, skapa en `config.json` fil:
+Om du föredrar att använda `config.json` istället för `.env`, skapa en `config.json` fil.
+API-nycklar kan också hanteras via **Hjälp → Inställningar → API-nycklar** direkt i GUI:t.
 
 ```json
 {
@@ -128,10 +133,18 @@ Om du föredrar att använda `config.json` istället för `.env`, skapa en `conf
   },
   "settings": {
     "auto_update_interval_minutes": 10,
-    "data_retention_days": 90
+    "data_retention_days": 90,
+    "dark_mode": false,
+    "temperature_unit": "C",
+    "map_default_layer": "stations",
+    "heatmap_opacity": 70,
+    "inversion_model_version": 3,
+    "debug_mode": false
   }
 }
 ```
+
+**OBS:** Nya inställningsnycklar slås samman vid uppgradering utan att befintliga värden skrivs över (`setdefault`-merge).
 
 **Prioritet:** API-nycklar läses i följande ordning:
 1. `.env` fil (högsta prioritet)
@@ -165,7 +178,7 @@ python main.py
 
 #### Verktygsfält
 - **"Hämta nu"** (F5): Manuell uppdatering av all väderdata
-- **"Auto-uppdatering"**: Toggle för automatisk uppdatering (av som standard)
+- **"Auto-uppdatering"**: Toggle för automatisk uppdatering (på som standard, 10 minuters intervall)
 
 #### Menubar
 - **Generera**: Exportera grafer i olika tidsperioder
@@ -175,6 +188,7 @@ python main.py
   - **Årlig**: Årsdata grupperat per månad
 - Grafer exporteras till `output/` katalogen
 - Grafgenerering körs i bakgrundstråd (GUI förblir responsiv)
+- **Hjälp → Inställningar**: Öppnar inställningsdialogen
 
 #### Vänsterpanel
 - **Lista över städer**: Klicka på en stad för att se detaljerad information
@@ -190,6 +204,7 @@ python main.py
 **Historik**
 - Välj stad från dropdown
 - Se historiska data för temperatur, luftfuktighet, vind och luftkvalitet
+- **Dynamiska parametrar**: Alla tillgängliga parametrar från databasen visas automatiskt
 
 **Statistik**
 - Kallast/varmast stad
@@ -203,6 +218,7 @@ python main.py
 - Välj mellan "Senaste värden" och "24h snitt"
 - **Totala datapunkter**: Visar totalt antal sparade mätningar i databasen
 - **Antal städer**: Visar antal städer i databasen
+- **Korrekt aggregering**: Snittvärden beräknas med lika vikt per stad (inte per datapunkt)
 
 **Varningar**
 - **Nationell översikt**: Snitt PM2.5 och AQI över alla städer
@@ -216,13 +232,15 @@ python main.py
   - 🟣 Lila: Mycket ohälsosamt (150.5-250.4 µg/m³)
   - ⚫ Mörkröd: Farligt (>250.4 µg/m³)
 
-**Stationer**
-- **Interaktiv karta**: Visa alla OpenAQ-stationer och sensorer
-- **Sensor-popups**: Klicka på marker för att se sensor-information
-- **Google Maps-länkar**: Direktlänkar till sensorer i Google Maps
-- **Custom markers**: Högerklicka på kartan för att lägga till egna sensorer/markörer
-- **Uppdatera Stationer**: Manuell uppdatering av sensor-data från databasen
-- **Krav**: PyQtWebEngine måste vara installerat för att kartan ska fungera
+**Stationer (Analytisk Karta)**
+- **Layer-toolbar**: Stationer / Heatmap / Sensorer — ett aktivt lager åt gången
+- **AQI-markörer**: Färg från `WarningDetector.get_threshold_metadata()`, yttre ring = vindhastighet
+- **Heatmap**: Täthetsmedveten interpolering, low-density varningsbadge i glesbefolkade regioner
+- **Analytiska popups**: PM2.5 24h sparkline, inversionsrisk 0–100, kalibrerings-metadata
+- **Klustervarningsbanner**: Visas automatiskt vid regional avvikelse från nationellt 7d-snitt
+- **Custom markers**: Högerklicka → formulär → sparas i databasen
+- **Debug-läge**: Aktiveras i Inställningar → Debug; exponerar rådata i popupsen
+- **Krav**: PyQtWebEngine måste vara installerat
 
 **API Status**
 - Status för alla API-källor
@@ -310,6 +328,32 @@ Alla loggar sparas i `logs/` katalogen:
 - **Konsol-output** för debugging
 - **GUI-integration** i Loggar-fliken
 
+## Tekniska Förbättringar (2026)
+
+### Dynamisk Parameter-Upptäckt
+- **Ingen hardcoding**: Parametrar (pm25, pm10, no2, o3, temperature, wind_speed, humidity) upptäcks automatiskt från databasschema
+- **Schema-baserad**: Använder `PRAGMA table_info()` för att upptäcka tillgängliga kolumner
+- **Logisk sortering**: Parametrar sorteras automatiskt (pollutants först, sedan väderparametrar)
+- **Fungerar för alla städer**: Inklusive Umeå och andra städer med varierande datatillgänglighet
+
+### Korrekt Nationellt Snitt
+- **Tidsstegsviktat medelvärde**: Varje stad har lika vikt per tidssteg
+- **Tvåstegs-aggregation**: Först aggregeras per stad per tidssteg, sedan över städer
+- **Ingen datapunkt-dominans**: Städer med fler datapunkter dominerar inte resultatet
+- **Validering**: Loggar antal städer per tidssteg för datakvalitetskontroll
+- **Hantering av saknad data**: NaN-värden exkluderas korrekt per parameter
+
+### Event-Driven UI Refresh
+- **Signal-baserad**: Använder PyQt `data_updated` signal för thread-safe uppdateringar
+- **Ingen timer-baserad refresh**: UI uppdateras endast när ny data faktiskt sparas
+- **Auto-update som standard**: Automatisk uppdatering är aktiverad vid start (10 minuters intervall)
+- **Debouncing**: Flera samtidiga uppdateringar debouncas till en enda UI-refresh
+
+### Förbättrad Datahantering
+- **Alltid spara pollutants**: Pollutant-värden sparas alltid, även om de är identiska (säkerställer UI-uppdateringar)
+- **Prioriterad hämtning**: `get_latest_weather()` prioriterar rader med pollutant-data
+- **Ingen aggressiv deduplicering**: Identiska värden sparas med ny timestamp för att säkerställa aktuell data
+
 ## Nya Funktioner (2026)
 
 ### Grafgenerering
@@ -320,24 +364,48 @@ Alla loggar sparas i `logs/` katalogen:
 - **Bakgrundstråd**: Grafgenerering körs i QThread för att hålla GUI responsivt
 - **Export**: Grafer sparas i `output/` katalogen med timestamp
 - **Inga fallbacks**: Om data saknas returneras None, ingen tom graf genereras
+- **Dynamisk parameter-upptäckt**: Parametrar upptäcks automatiskt från databasschema (ingen hardcoding)
+- **Korrekt nationellt snitt**: Nationellt snitt använder tidsstegsviktat medelvärde där varje stad har lika vikt
 
-### Stationer och Sensorer
-- **Interaktiv Leaflet-karta**: Visa alla OpenAQ-sensorer och custom markers
-- **Database-first**: Alla sensorer lagras i databasen, läsning från DB
-- **Dynamisk uppdatering**: Sensorer uppdateras när OpenAQ returnerar data
-- **Custom markers**: Lägg till egna sensorer/markörer via context menu
-- **PyQtWebEngine**: Valfritt beroende (graceful degradation om inte installerat)
+### Analytisk Karta och Stationer
+- **Interaktiv Leaflet-karta** med tre lager (Stationer, Heatmap, Sensorer)
+- **AQI-markörer**: Färg dynamiskt från `WarningDetector.get_threshold_metadata()` — ingen hårdkodad hex-värde i GUI-koden
+- **Täthetsmedveten heatmap**: Interpoleringsradius skalas med grannstationsantal; `low_density`-flagga ger varningsbadge i sparsamma regioner
+- **Analytiska popups**: Inline SVG-sparkline, inversionsriskpoäng 0–100 med mätarbar, kalibrerings-metadata (N mätningar, p5–p95 gränser)
+- **Regional klusteranalys**: `deviation_factor` härleds från `WarningDetector.THRESHOLDS` — uppdateras automatiskt vid WHO/EPA-revisioner
+- **Inversionsriskmodell v3**: Winsoriserade p5/p95-gränser, temporalt stabila poäng, null-safe
+- **Debug-läge**: Konfigureras i Inställningar; exponerar `wind_norm`, `hum_norm`, `national_baseline`, `deviation_factor`, `inversion_model_version`
+- **Database-first**: Alla sensorer och custom markers lagras i databasen
+
+### Inställningar (Settings Dialog)
+- **5-flik inställningsdialog** tillgänglig via Hjälp → Inställningar
+- **Utseende**: Mörkt läge (full QSS-tema), temperaturenhet (°C/°F)
+- **Karta**: Standard kartlager, heatmap opacitet (0–100)
+- **Data**: Auto-update intervall, datalagring (dagar)
+- **API-nycklar**: OpenWeatherMap och OpenAQ (maskerade fält, sparas i `config.json`)
+- **Debug**: Debug-läge toggle för analytisk transparens
+- Alla värden läses från `ConfigLoader` vid öppning — inga hårdkodade defaults i dialogen
+- Atomär `update_config()` på OK — inget partiellt tillstånd
+- Sekvenserade sidoeffekter vid stängning: `apply_theme` → `pause_auto_update` → `load_map` → `restart_auto_update`
+
+### WarningDetector.get_threshold_metadata()
+- Ny `@staticmethod` som returnerar en ordnad `List[Dict]` med threshold/färg/namn/AQI-range för alla nivåer
+- Kräver ingen instans och ingen databas
+- Enda stabila publika API:t för alla konsumenter som behöver tröskeldata (HelpDialog, framtida komponenter)
+- Uppdateringar i `THRESHOLDS` sprids automatiskt till alla konsumenter
 
 ### Intelligent Data Storage
 - **Measurement timestamps**: Använder API:ernas faktiska measurement timestamps
-- **Deduplicering**: Undviker att spara samma mätning flera gånger
-- **Smart lagring**: Jämför nya värden med senaste sparade värden
+- **Deduplicering**: Undviker att spara samma mätning flera gånger baserat på measurement timestamps
+- **Alltid spara pollutants**: Pollutant-värden sparas alltid, även om de är identiska (för att säkerställa UI-uppdateringar)
 - **Separat hantering**: Väderdata och luftkvalitetsdata hanteras separat
+- **Prioriterad hämtning**: `get_latest_weather()` prioriterar rader med pollutant-data
 
-### Real-time GUI
-- **Automatisk uppdatering**: GUI uppdateras var 5:e sekund automatiskt
-- **Oberoende av auto-update**: Fungerar även när auto-update är avstängt
-- **Ingen manuell refresh**: Användaren behöver inte bläddra för att se nya data
+### Event-Driven UI Refresh
+- **Event-driven uppdatering**: GUI uppdateras endast när ny data faktiskt sparas till databasen
+- **Automatisk uppdatering**: Auto-update är aktiverad som standard (10 minuters intervall)
+- **Ingen timer-baserad refresh**: UI uppdateras inte om ingen ny data finns
+- **Signal-baserad**: Använder PyQt signals för thread-safe UI-uppdateringar
 
 ### Data Points Count
 - **Korrekt räkning**: Visar totalt antal rader i weather_data tabellen
@@ -348,21 +416,32 @@ Alla loggar sparas i `logs/` katalogen:
 
 ### Inga Fallbacks
 - **Inga hårdkodade värden**: Alla värden kommer från API:er eller databasen
+- **Inga hårdkodade parametrar**: Parametrar (pm25, pm10, no2, o3, etc.) upptäcks dynamiskt från databasschema
 - **"Ingen data"**: Om data saknas visas detta tydligt
 - **Transparent**: Användaren ser exakt vad som händer
 - **No data is better than mock data**: Inga mock-värden eller fallback-data
 
 ### Dynamisk
 - **Inga hårdkodade städer**: Lägg till/ta bort städer dynamiskt
+- **Inga hårdkodade parametrar**: Alla parametrar upptäcks från databasschema
 - **Flexibel konfiguration**: Alla inställningar i config.json eller .env
-- **Anpassningsbar**: Lätt att lägga till nya API-källor
+- **Anpassningsbar**: Lätt att lägga till nya API-källor eller parametrar
 - **Mode-baserad arkitektur**: Grafgenerering byggd på polymorf design
+- **Dynamisk parameter-ordning**: Parametrar sorteras logiskt (pollutants först, sedan väder)
 
 ### Produktionsredo
 - **Felhantering**: Robust hantering av API-fel, nätverksfel, databasfel
 - **Thread-safety**: Thread-safe databashantering
 - **Rate limiting**: Skydd mot API-rate limits
 - **Loggning**: Omfattande loggning för felsökning
+
+## Dokumentation
+
+### Detaljerad Teknisk Dokumentation
+
+- **[API Retrieval and Data Flow](docs/API_AND_DATA_FLOW.md)** — API-providers, datahämtning, deduplicering, timestamp-hantering, rate limiting, dataflödesdiagram
+- **[Analytical Map](docs/ANALYTICAL_MAP.md)** — `MapDataBuilder`, inversionsriskmodell v3, klusteranalys, täthetsmedveten heatmap, DB-frågor, JavaScript-lager, null-policy
+- **[Settings Dialog](docs/SETTINGS.md)** — `SettingsDialog`, `apply_theme()`, alla config-nycklar, sekvenserade sidoeffekter, config-merge-säkerhet
 
 ## Utveckling
 
@@ -400,12 +479,18 @@ Weather app/
 │   ├── stats_tab.py
 │   ├── averages_tab.py
 │   ├── warnings_tab.py
-│   ├── stations_tab.py
+│   ├── stations_tab.py    # Analytisk karta (MapDataBuilder, Leaflet JS)
+│   ├── help_dialog.py     # Hjälpdialog (6 flikar, dynamisk AQI-tabell)
+│   ├── settings_dialog.py # Inställningsdialog + apply_theme()
 │   ├── api_status_tab.py
 │   └── logs_tab.py
+├── docs/                  # Teknisk dokumentation
+│   ├── ANALYTICAL_MAP.md  # Kartarkitektur, inversion, kluster, DB-frågor
+│   ├── SETTINGS.md        # Settings dialog, config-nycklar, tema
+│   └── API_AND_DATA_FLOW.md
 └── utils/                # Hjälpfunktioner
     ├── logger.py
-    ├── config_loader.py
+    ├── config_loader.py   # DEFAULT_CONFIG + setdefault-merge
     ├── rate_limiter.py
     └── aqi_calculator.py
 ```
@@ -432,6 +517,16 @@ Weather app/
 ### Rate limit-fel
 - Applikationen hanterar detta automatiskt
 - Om problem kvarstår: Öka väntetid mellan uppdateringar i config
+
+### Heatmap renderas inte
+- **Symptom**: `js: Uncaught IndexSizeError: Failed to execute 'getImageData' ... source width is 0`
+- **Orsak**: `leaflet.heat` försöker rita på canvas innan Qt:s layout-motor har tilldelat pixeldimensioner
+- **Lösning**: Heatmap-skapandet är fördröjt 300 ms med `setTimeout` + `map.invalidateSize()` för att tvinga Leaflet att fråga om behållarens dimensioner från Qt innan canvasen berörs — detta är redan implementerat
+
+### Inversion score visas inte (null)
+- Kräver minst 20 historiska rader för `wind_speed` och `humidity`
+- Kontrollera "Historik < 20 rader" i stationspopupen
+- Samla in mer data, sedan laddas om kartan automatiskt
 
 ## Licens
 

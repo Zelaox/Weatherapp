@@ -434,8 +434,56 @@ The following four named constants are the **complete and exhaustive set** of no
 
 All other values used in computations are either:
 - Fetched from `weather_data` (bounds, means, counts)
-- Derived from `WarningDetector.THRESHOLDS` (deviation factor, AQI levels, colours)
+- Derived from `WarningDetector.get_threshold_metadata()` (deviation factor, AQI levels, colours)
 - Computed from the data itself (median latitude, region means, density counts)
+
+---
+
+## WarningDetector.get_threshold_metadata()
+
+This `@staticmethod` is the single stable public API for all consumers that need threshold/colour/label data.
+
+```python
+metadata = WarningDetector.get_threshold_metadata()
+# Returns: List[Dict] — one entry per AQI level, ordered low → high
+
+# Each entry:
+{
+    "level":      "good",          # internal key
+    "name":       "Bra",           # display label (Swedish)
+    "color":      "#00e400",       # hex colour string
+    "min_pm25":   0.0,             # lower PM2.5 bound µg/m³
+    "max_pm25":   12.0,            # upper PM2.5 bound µg/m³  (None for last level)
+    "aqi_min":    0,               # AQI range low
+    "aqi_max":    50               # AQI range high           (None for last level)
+}
+```
+
+**Invariants:**
+- No `DatabaseManager` instance required
+- No runtime side effects
+- Calling this before any DB connection is safe
+- Order is stable and determined by `_LEVEL_ORDER`
+
+**Consumers:** `HelpDialog`, `MapDataBuilder` (deviation_factor), JavaScript `PAYLOAD.gradient` (AQI colours for heatmap)
+
+---
+
+## Debug Mode
+
+When `config.json` contains `"debug_mode": true` (set via **Inställningar → Debug**), each station popup exposes an additional panel:
+
+| Field | Source |
+|---|---|
+| `wind_raw` | `city.wind_speed` (m/s, as-fetched) |
+| `hum_raw` | `city.humidity` (%, as-fetched) |
+| `wind_norm` | `(wind_raw - wind_lo) / wind_range` |
+| `hum_norm` | `(hum_raw - hum_lo) / hum_range` |
+| `national_baseline` | `national_7day_mean` (µg/m³) |
+| `deviation_factor` | derived from `get_threshold_metadata()` |
+| `inversion_model_version` | `config["settings"]["inversion_model_version"]` |
+
+Debug mode never alters the computed values — it only reveals them. All fields are `null`-safe; if a value is `null` the label reads `"n/a"`.
 
 ---
 
