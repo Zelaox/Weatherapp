@@ -31,7 +31,13 @@ class ConfigLoader:
         "settings": {
             "auto_update_interval_minutes": 10,
             "data_retention_days": 90,
-            "default_cities": []
+            "default_cities": [],
+            "dark_mode": False,
+            "temperature_unit": "C",           # "C" | "F"
+            "map_default_layer": "stations",   # "stations" | "heatmap" | "sensors"
+            "heatmap_opacity": 70,             # integer 0–100
+            "inversion_model_version": 3,      # incremented on model formula changes; never reset
+            "debug_mode": False,
         }
     }
     
@@ -61,6 +67,10 @@ class ConfigLoader:
                     merged["api_keys"].update(config["api_keys"])
                 if "settings" in config:
                     merged["settings"].update(config["settings"])
+                # Merge-safety: insert any new DEFAULT_CONFIG keys that are absent
+                # from the user's existing config.json without overwriting their values.
+                for key, default_val in self.DEFAULT_CONFIG["settings"].items():
+                    merged["settings"].setdefault(key, default_val)
                 logger.info("Konfiguration laddad")
                 return merged
             except (json.JSONDecodeError, IOError) as e:

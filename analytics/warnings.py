@@ -5,6 +5,19 @@ from database.db_manager import DatabaseManager
 from utils.aqi_calculator import calculate_aqi_from_pm25_24h
 
 
+# Canonical level order with AQI display ranges.
+# Defined once here; consumed only by get_threshold_metadata().
+# Never imported by external modules — they call the public staticmethod instead.
+_LEVEL_ORDER: List[tuple] = [
+    ("good",                "0–50"),
+    ("moderate",            "51–100"),
+    ("unhealthy_sensitive", "101–150"),
+    ("unhealthy",           "151–200"),
+    ("very_unhealthy",      "201–300"),
+    ("hazardous",           "301–500"),
+]
+
+
 class WarningDetector:
     """Detect dangerous PM2.5 levels and generate warnings."""
     
@@ -38,6 +51,39 @@ class WarningDetector:
         'hazardous': '#7e0023'           # Maroon
     }
     
+    @staticmethod
+    def get_threshold_metadata() -> List[Dict]:
+        """
+        Return threshold metadata for all AQI levels, ordered by ascending PM2.5.
+
+        No instance required. No database access. Pure class-level data.
+        This is the single stable public API for any consumer that needs
+        threshold/color/label data without constructing a WarningDetector instance.
+
+        Returns:
+            List of dicts, one per level, in ascending PM2.5 order:
+            [
+                {
+                    "level_key":  str,    # internal key, e.g. "good"
+                    "threshold":  float,  # upper PM2.5 boundary (µg/m³)
+                    "level_name": str,    # Swedish label, e.g. "Bra"
+                    "color":      str,    # hex color, e.g. "#00e400"
+                    "aqi_range":  str,    # display string, e.g. "0–50"
+                },
+                ...
+            ]
+        """
+        return [
+            {
+                "level_key":  key,
+                "threshold":  WarningDetector.THRESHOLDS[key],
+                "level_name": WarningDetector.LEVEL_NAMES[key],
+                "color":      WarningDetector.LEVEL_COLORS[key],
+                "aqi_range":  aqi_range,
+            }
+            for key, aqi_range in _LEVEL_ORDER
+        ]
+
     def __init__(self, db_manager: DatabaseManager):
         """
         Initialize warning detector.

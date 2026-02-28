@@ -2,7 +2,8 @@
 
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QTabWidget,
-    QToolBar, QAction, QStatusBar, QDialog, QDateEdit, QPushButton
+    QToolBar, QAction, QStatusBar, QDialog, QDateEdit, QPushButton,
+    QApplication
 )
 from PyQt5.QtCore import QDate
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
@@ -17,6 +18,7 @@ from gui.api_status_tab import APIStatusTab
 from gui.logs_tab import LogsTab
 from gui.stations_tab import StationsTab
 from gui.help_dialog import HelpDialog
+from gui.settings_dialog import SettingsDialog, apply_theme
 from analytics.graph_generator import GraphGenerator
 from analytics.graph_modes import MODES, BaseMode
 from zoneinfo import ZoneInfo
@@ -115,7 +117,11 @@ class MainWindow(QMainWindow):
         self.pending_refresh = False
         
         self._init_ui()
-        
+
+        # Restore saved theme (dark / light) before the window is shown
+        dark = bool(self.controller.config.get_setting("dark_mode", False))
+        apply_theme(QApplication.instance(), dark)
+
         # Connect data_updated signal to refresh (event-driven)
         self.controller.data_updated.connect(self._on_data_updated)
         self.controller.logger.info("Event-driven UI refresh aktiverad (uppdateras endast vid ny data)")
@@ -218,6 +224,12 @@ class MainWindow(QMainWindow):
         help_action = QAction("Funktioner och Hjälp", self)
         help_action.triggered.connect(self._show_help_dialog)
         help_menu.addAction(help_action)
+
+        help_menu.addSeparator()
+
+        settings_action = QAction("Inställningar", self)
+        settings_action.triggered.connect(self._show_settings_dialog)
+        help_menu.addAction(settings_action)
     
     def _toggle_auto_update(self, checked: bool):
         """Toggle auto-update on/off."""
@@ -239,7 +251,62 @@ class MainWindow(QMainWindow):
         """Show help dialog with feature dictionary."""
         dialog = HelpDialog(self)
         dialog.exec_()
-    
+
+    def _show_settings_dialog(self):
+        """
+        Open settings dialog and apply sequenced post-close side-effects.
+
+        Sequence (matches plan):
+          1. apply_theme()                — always, immediate
+          2. pause_auto_update()          — if interval changed and auto-update is active
+          3. stations_tab._load_map()     — if map/debug settings changed
+          4. restart_auto_update(minutes) — if interval changed and was previously active
+        """
+        cfg = self.controller.config
+
+        # Snapshot values before the dialog opens so we can detect changes
+        old_interval    = cfg.get_setting("auto_update_interval_minutes")
+        old_layer       = cfg.get_setting("map_default_layer")
+        old_opacity     = cfg.get_setting("heatmap_opacity")
+        old_debug       = cfg.get_setting("debug_mode")
+
+        dialog = SettingsDialog(cfg, parent=self)
+        result = dialog.exec_()
+
+        if result != QDialog.Accepted:
+            return
+
+        # ── Step 1: Apply theme (always) ─────────────────────────────────
+        dark = bool(cfg.get_setting("dark_mode", False))
+        apply_theme(QApplication.instance(), dark)
+
+        # ── Step 2: Pause auto-update if interval changed and timer is active
+        new_interval = cfg.get_setting("auto_update_interval_minutes")
+        interval_changed = (new_interval != old_interval)
+        auto_update_is_active = self.auto_update_action.isChecked()
+
+        if interval_changed and auto_update_is_active:
+            if hasattr(self.controller, "pause_auto_update"):
+                self.controller.pause_auto_update()
+
+        # ── Step 3: Reload map if any map or debug setting changed ────────
+        new_layer   = cfg.get_setting("map_default_layer")
+        new_opacity = cfg.get_setting("heatmap_opacity")
+        new_debug   = cfg.get_setting("debug_mode")
+
+        map_settings_changed = (
+            new_layer   != old_layer   or
+            new_opacity != old_opacity or
+            new_debug   != old_debug
+        )
+        if map_settings_changed:
+            self.stations_tab._load_map()
+
+        # ── Step 4: Restart auto-update with new interval ─────────────────
+        if interval_changed and auto_update_is_active:
+            if hasattr(self.controller, "restart_auto_update"):
+                self.controller.restart_auto_update(int(new_interval))
+
     def _on_city_selected(self, city_id: int):
         """Handle city selection."""
         self.weather_panel.set_city(city_id)

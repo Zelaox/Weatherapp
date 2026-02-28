@@ -95,6 +95,17 @@ def main():
         # Add scheduler methods to controller for GUI access
         controller.start_auto_update = scheduler.start
         controller.stop_auto_update = scheduler.stop
+
+        # pause_auto_update: halts the timer without clearing the "enabled" toolbar state.
+        # Identical to stop; named separately so call-sites are semantically clear.
+        controller.pause_auto_update = scheduler.stop
+
+        def _restart_auto_update(minutes: int):
+            """Set a new interval then restart the scheduler."""
+            scheduler.set_interval(minutes)
+            scheduler.start()
+
+        controller.restart_auto_update = _restart_auto_update
         def safe_manual_update():
             """Safely trigger manual update."""
             try:
@@ -107,9 +118,10 @@ def main():
         controller.manual_update = safe_manual_update
         logger.info("Scheduler-metoder kopplade till controller")
         
-        # Auto-update is off by default - user can enable it via toolbar button
-        # scheduler.start()  # Not started by default
-        logger.info("Auto-uppdatering är av som standard (använd knappen i verktygsfältet för att aktivera)")
+        # Auto-update: Start by default to ensure data updates
+        # User can disable it via toolbar button if desired
+        scheduler.start()
+        logger.info("Auto-uppdatering startad som standard (intervall: 10 minuter)")
         
         # Initialize new sensor engine system (optional, can be enabled separately)
         sensor_engine = None
