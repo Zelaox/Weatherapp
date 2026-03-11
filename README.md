@@ -327,8 +327,16 @@ Alla loggar sparas i `logs/` katalogen:
 - **Strukturerad loggning** till fil
 - **Konsol-output** för debugging
 - **GUI-integration** i Loggar-fliken
+- **Omfattande debug-logging**: Detaljerad logging för API-requests, parameter-upptäckt och dataextraktion
+- **Format string-fix**: WeatherLogger stödjer nu endast f-strings (inga format placeholders med %s)
 
 ## Tekniska Förbättringar (2026)
+
+### Förbättrad Datahämtning (CAPE och Solar)
+- **Robust fallback-logik**: Solar- och storm-parametrar (CAPE, solar_radiation, uv_index, etc.) hämtas alltid även om parameter_registry är tom
+- **Omfattande debug-logging**: Detaljerad logging för parameter-upptäckt, API-requests och dataextraktion
+- **Automatisk parameter-tillägg**: Om parametrar saknas i registry läggs de automatiskt till i API-requests
+- **Tydlig felhantering**: Varningar när parametrar saknas med detaljerad information om varför
 
 ### Dynamisk Parameter-Upptäckt
 - **Ingen hardcoding**: Parametrar (pm25, pm10, no2, o3, temperature, wind_speed, humidity) upptäcks automatiskt från databasschema
