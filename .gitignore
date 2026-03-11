@@ -34,6 +34,10 @@ ENV/
 # Application specific
 config.json
 weather.db
+weather.db-shm
+weather.db-wal
+*.db-shm
+*.db-wal
 logs/
 *.log
 
