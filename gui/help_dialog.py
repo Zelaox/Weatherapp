@@ -142,7 +142,6 @@ class HelpDialog(QDialog):
         <p>Applikationen använder flera API-källor för redundans:</p>
         <ul>
             <li><b>Open-Meteo</b> (Primär): Väderdata, ingen API-nyckel krävs</li>
-            <li><b>OpenWeatherMap</b> (Backup): Väderdata, kräver gratis API-nyckel</li>
         </ul>
 
         <h2>Uppdatering</h2>
@@ -198,7 +197,6 @@ class HelpDialog(QDialog):
         <h2>Datakällor</h2>
         <ul>
             <li><b>OpenAQ</b>: Rådata för PM2.5, PM10, NO₂, O₃ (kräver API-nyckel)</li>
-            <li><b>OpenWeatherMap</b>: Kategorisk AQI och rådata (kräver API-nyckel)</li>
         </ul>
 
         <h2>Varningar</h2>
@@ -300,7 +298,7 @@ class HelpDialog(QDialog):
         <h2>Analytiska Popups</h2>
         <p>Klicka på en AQI-markör för att se:</p>
         <ul>
-            <li><b>24h sparkline</b>: Inline SVG-trend för PM2.5 de senaste 24 timmarna</li>
+            <li><b>24h sparkline</b>: Inline trend för PM2.5 de senaste 24 timmarna</li>
             <li><b>Inversionsrisk</b>: 0–100-poäng med färgad mätarbar</li>
             <li><b>Kalibrering</b>: "Kalibrerad mot N mätningar (p5–p95), Vind X–Y m/s · Fuktighet A–B%"</li>
             <li><b>Low-density badge</b>: Varning om stationsdata är gles i området</li>
@@ -375,7 +373,7 @@ class HelpDialog(QDialog):
         <ol>
             <li><b>Stadsnamn + AQI-nivå</b>: Dynamisk rubrik med AQI-färg</li>
             <li><b>PM2.5 24h medelvärde</b>: µg/m³</li>
-            <li><b>24h sparkline</b>: Inline SVG med PM2.5-trend (upp till 24 datapunkter)</li>
+            <li><b>24h sparkline</b>: Inline med PM2.5-trend (upp till 24 datapunkter)</li>
             <li><b>Inversionsrisk</b>: 0–100 poäng med färgad horisontell mätarbar</li>
             <li><b>Kalibrering</b>: Antal historiska mätningar, vindbounds (p5–p95), luftfuktighetsbounds</li>
             <li><b>Low-density varning</b>: Visas om stationen är i ett glest mätarområde</li>
@@ -420,18 +418,20 @@ class HelpDialog(QDialog):
         </ul>
 
         <h2>Poängformel</h2>
-        <p>Vikterna är modulkonstanter definierade i <code>stations_tab.py</code>
-        (inte magic numbers):</p>
+        <p>Vikterna läses från <code>calibration_parameters</code>-tabellen i databasen
+        (standardvärden: <code>inversion_wind_weight = 0.6</code>, 
+        <code>inversion_humidity_weight = 0.4</code>):</p>
         <pre style='background:#f4f4f4;padding:8px;'>
 wind_norm = clamp((wind_speed - wind_lo) / (wind_hi - wind_lo), 0, 1)
 hum_norm  = clamp((humidity   - hum_lo)  / (hum_hi  - hum_lo),  0, 1)
 
 inversion_score = (
-    (1 - wind_norm) * 0.6    # hög vind → låg risk
-  +     hum_norm   * 0.4     # hög luftfuktighet → högre risk
+    (1 - wind_norm) * wind_weight      # hög vind → låg risk
+  +     hum_norm   * humidity_weight   # hög luftfuktighet → högre risk
 ) * 100
         </pre>
         <p>Utdataområde: <b>0</b> (ingen risk) till <b>100</b> (maximal observerad risk).</p>
+        <p><b>Viktigt:</b> Alla parametrar (vikter, percentiler) kommer från databasen — inga hårdkodade värden i koden.</p>
 
         <h2>Winsorisering — varför?</h2>
         <p>Gränserna <code>wind_lo / wind_hi</code> och <code>hum_lo / hum_hi</code> är
@@ -468,6 +468,18 @@ inversion_score = (
             </tr>
         </table>
 
+        <h2>Kalibreringsparametrar (DB-drivna)</h2>
+        <p>Alla analytiska modellparametrar (inversion percentiler, vikter, IDW-parametrar) 
+        läses från <code>calibration_parameters</code>-tabellen i databasen vid körning. 
+        Inga hårdkodade konstanter finns längre i koden.</p>
+        <p>Viktiga parametrar:</p>
+        <ul>
+            <li><code>inversion_p_low</code>, <code>inversion_p_high</code>: Winsoriseringspercentiler (standard: 5, 95)</li>
+            <li><code>inversion_wind_weight</code>, <code>inversion_humidity_weight</code>: Vikter för inversion score (standard: 0.6, 0.4)</li>
+            <li><code>idw_power</code>, <code>idw_max_r_factor</code>, <code>idw_scale_percentile</code>: IDW heatmap-parametrar</li>
+        </ul>
+        <p>Om en obligatorisk parameter saknas i databasen, misslyckas systemet högljutt med ett tydligt felmeddelande — inga tysta fallbacks till kodkonstanter.</p>
+
         <h2>Kalibrerings-metadata i popup</h2>
         <p>Varje popup som visar en inversionspoäng inkluderar:</p>
         <pre style='background:#f4f4f4;padding:8px;'>
@@ -475,7 +487,8 @@ Kalibrerad mot 4821 mätningar (p5–p95)
 Vind: 0.2–9.1 m/s · Fuktighet: 52–94%
         </pre>
         <p>Detta låter användaren bedöma om gränserna är mogna (stort N, bred spridning)
-        eller fortfarande osäkra (litet N, smal spridning).</p>
+        eller fortfarande osäkra (litet N, smal spridning). Percentilerna (p5–p95) kommer från 
+        <code>calibration_parameters</code>-tabellen, inte från hårdkodade värden.</p>
 
         <h2>Modellversion</h2>
         <p>Aktuell version lagras i <code>config.settings.inversion_model_version</code>

@@ -1,9 +1,14 @@
 """Logs tab."""
 
 from PyQt5.QtWidgets import (
-    QWidget, QVBoxLayout, QTextEdit, QPushButton, QHBoxLayout
+    QWidget,
+    QVBoxLayout,
+    QTextEdit,
+    QPushButton,
+    QHBoxLayout,
 )
 from PyQt5.QtCore import Qt
+import json
 
 
 class LogsTab(QWidget):
@@ -36,6 +41,10 @@ class LogsTab(QWidget):
         clear_button = QPushButton("Rensa")
         clear_button.clicked.connect(self._clear_logs)
         button_layout.addWidget(clear_button)
+
+        debug_button = QPushButton("Debugrapport")
+        debug_button.clicked.connect(self._show_debug_report)
+        button_layout.addWidget(debug_button)
         
         button_layout.addStretch()
         layout.addLayout(button_layout)
@@ -61,3 +70,16 @@ class LogsTab(QWidget):
         """Clear logs."""
         self.controller.clear_logs()
         self.refresh()
+
+    def _show_debug_report(self):
+        """Generate and display a dynamic debug report."""
+        try:
+            report = self.controller.generate_dynamic_debug_report()
+            # Pretty-print JSON, but keep it generic and data-driven
+            text = json.dumps(report, indent=2, ensure_ascii=False)
+            self.log_text.clear()
+            self.log_text.setPlainText(text)
+            scrollbar = self.log_text.verticalScrollBar()
+            scrollbar.setValue(scrollbar.minimum())
+        except Exception as e:
+            self.log_text.append(f"\n[DEBUG] Kunde inte generera debugrapport: {e}")

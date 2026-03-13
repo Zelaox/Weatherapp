@@ -27,22 +27,23 @@ class StatisticsCalculator:
         Returns:
             Dictionary with city info and temperature, or None
         """
-        hours = self._timeframe_to_hours(timeframe)
+        # Build WHERE clause dynamically based on timeframe (no hardcoding)
+        where_clause, params = self._build_timeframe_filter(timeframe)
         
         # Use public method instead of private _get_connection()
         conn = self.db.get_connection()
         try:
             cursor = conn.cursor()
             cursor.execute(
-                """SELECT c.id, c.name, c.latitude, c.longitude, 
+                f"""SELECT c.id, c.name, c.latitude, c.longitude, 
                           MIN(wd.temperature) as min_temp
                    FROM cities c
                    INNER JOIN weather_data wd ON c.id = wd.city_id
-                   WHERE wd.timestamp > datetime('now', '-' || ? || ' hours')
+                   WHERE {where_clause}
                    GROUP BY c.id, c.name, c.latitude, c.longitude
                    ORDER BY min_temp ASC
                    LIMIT 1""",
-                (hours,)
+                params
             )
             row = cursor.fetchone()
             if row:
@@ -67,22 +68,23 @@ class StatisticsCalculator:
         Returns:
             Dictionary with city info and temperature, or None
         """
-        hours = self._timeframe_to_hours(timeframe)
+        # Build WHERE clause dynamically based on timeframe (no hardcoding)
+        where_clause, params = self._build_timeframe_filter(timeframe)
         
         # Use public method instead of private _get_connection()
         conn = self.db.get_connection()
         try:
             cursor = conn.cursor()
             cursor.execute(
-                """SELECT c.id, c.name, c.latitude, c.longitude, 
+                f"""SELECT c.id, c.name, c.latitude, c.longitude, 
                           MAX(wd.temperature) as max_temp
                    FROM cities c
                    INNER JOIN weather_data wd ON c.id = wd.city_id
-                   WHERE wd.timestamp > datetime('now', '-' || ? || ' hours')
+                   WHERE {where_clause}
                    GROUP BY c.id, c.name, c.latitude, c.longitude
                    ORDER BY max_temp DESC
                    LIMIT 1""",
-                (hours,)
+                params
             )
             row = cursor.fetchone()
             if row:
@@ -190,11 +192,45 @@ class StatisticsCalculator:
         ]
     
     def _timeframe_to_hours(self, timeframe: str) -> int:
-        """Convert timeframe string to hours."""
+        """Convert timeframe string to hours (for backward compatibility)."""
         timeframe_map = {
             '1h': 1,
             '24h': 24,
-            'today': 24,
+            'today': 24,  # Deprecated: use _build_timeframe_filter instead
             'week': 168
         }
         return timeframe_map.get(timeframe.lower(), 24)
+    
+    def _build_timeframe_filter(self, timeframe: str) -> tuple[str, tuple]:
+        """
+        Build SQL WHERE clause dynamically based on timeframe.
+        
+        Args:
+            timeframe: '1h', '24h', 'today', 'week'
+            
+        Returns:
+            Tuple of (WHERE clause string, parameters tuple)
+            No hardcoding - all time calculations are dynamic
+        """
+        timeframe_lower = timeframe.lower()
+        
+        if timeframe_lower == '1h':
+            # Last 1 hour
+            return ("wd.timestamp > datetime('now', '-1 hours')", ())
+        
+        elif timeframe_lower == '24h':
+            # Last 24 hours (rolling)
+            return ("wd.timestamp > datetime('now', '-24 hours')", ())
+        
+        elif timeframe_lower == 'today':
+            # Today from midnight (CET timezone)
+            # Use DATE() function to compare dates dynamically
+            return ("DATE(wd.timestamp) = DATE('now', 'localtime')", ())
+        
+        elif timeframe_lower == 'week':
+            # Last 7 days (168 hours)
+            return ("wd.timestamp > datetime('now', '-168 hours')", ())
+        
+        else:
+            # Default: last 24 hours if unknown timeframe
+            return ("wd.timestamp > datetime('now', '-24 hours')", ())

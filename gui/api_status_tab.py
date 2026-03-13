@@ -50,8 +50,7 @@ class APIStatusTab(QWidget):
         
         # Provider rows
         self.openmeteo_status = self._create_status_row("Open-Meteo", status_layout, 1)
-        self.openweather_status = self._create_status_row("OpenWeatherMap", status_layout, 2)
-        self.openaq_status = self._create_status_row("OpenAQ", status_layout, 3)
+        self.openaq_status = self._create_status_row("OpenAQ", status_layout, 2)
         
         layout.addWidget(status_group)
         layout.addStretch()
@@ -86,15 +85,6 @@ class APIStatusTab(QWidget):
         # Open-Meteo
         openmeteo = providers.get('openmeteo', {})
         self._update_status(self.openmeteo_status, openmeteo.get('available', False), None)
-        
-        # OpenWeather
-        openweather = providers.get('openweather', {})
-        has_key = openweather.get('has_key', False)
-        self._update_status(
-            self.openweather_status,
-            openweather.get('available', False),
-            "Ja" if has_key else "Nej"
-        )
         
         # OpenAQ
         openaq = providers.get('openaq', {})

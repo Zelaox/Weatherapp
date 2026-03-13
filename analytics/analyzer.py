@@ -171,6 +171,26 @@ class WeatherAnalyzer:
             wind_speeds = [w['wind_speed'] for w in all_weather if w.get('wind_speed') is not None]
             pm25_values = [w['pm25'] for w in all_weather if w.get('pm25') is not None]
             
+            # Validera vindhastighet - logga om orimligt höga värden (tröskel från calibration_parameters)
+            wind_warning_threshold = self.db.get_calibration_parameter("wind_speed_warning_threshold_mps")
+            if wind_warning_threshold is None:
+                wind_warning_threshold = 15.0
+            else:
+                try:
+                    wind_warning_threshold = float(wind_warning_threshold)
+                except (TypeError, ValueError):
+                    wind_warning_threshold = 15.0
+            if wind_speeds:
+                high_wind_cities = [w for w in all_weather if w.get('wind_speed') is not None and w.get('wind_speed') > wind_warning_threshold]
+                if high_wind_cities:
+                    logger.warning(
+                        f"Orimligt höga vindhastigheter upptäckta: {len(high_wind_cities)} städer med >{wind_warning_threshold:.1f} m/s. "
+                        f"Max: {max(wind_speeds):.1f} m/s, Min: {min(wind_speeds):.1f} m/s, "
+                        f"Medel: {sum(wind_speeds) / len(wind_speeds):.1f} m/s"
+                    )
+                else:
+                    logger.debug(f"Vindhastighet validering OK: {len(wind_speeds)} städer, Medel: {sum(wind_speeds) / len(wind_speeds):.1f} m/s")
+            
             # Log data availability for debugging
             logger.info(f"Found {len(pm25_values)} cities with PM2.5 data out of {len(all_weather)} total weather records")
             if pm25_values:
@@ -339,3 +359,11 @@ class WeatherAnalyzer:
         
         # Return top N cities
         return city_data[:limit]
+    
+    def get_warning_statistics(self) -> Dict:
+        """
+        Proxy to WarningDetector.get_warning_statistics() for GUI (WarningsTab).        Returns:
+            Dictionary with counts of cities in each warning level.
+        """
+        logger.debug("Hämtar varningsstatistik för alla städer")
+        return self.warning_detector.get_warning_statistics()

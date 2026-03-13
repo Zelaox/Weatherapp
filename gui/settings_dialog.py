@@ -325,13 +325,6 @@ class SettingsDialog(QDialog):
         form = QFormLayout()
         form.setSpacing(10)
 
-        self._ow_key = QLineEdit()
-        self._ow_key.setEchoMode(QLineEdit.PasswordEchoOnEdit)
-        self._ow_key.setPlaceholderText("OpenWeatherMap API-nyckel")
-        ow_val = self._cfg.config.get("api_keys", {}).get("openweather") or ""
-        self._ow_key.setText(ow_val)
-        form.addRow("OpenWeatherMap:", self._ow_key)
-
         self._oaq_key = QLineEdit()
         self._oaq_key.setEchoMode(QLineEdit.PasswordEchoOnEdit)
         self._oaq_key.setPlaceholderText("OpenAQ API-nyckel")
@@ -375,7 +368,6 @@ class SettingsDialog(QDialog):
         unit = "C" if self._temperature_unit.currentIndex() == 0 else "F"
         layer = self._map_layer.currentData()
 
-        ow_key  = self._ow_key.text().strip() or None
         oaq_key = self._oaq_key.text().strip() or None
 
         self._cfg.update_config({
@@ -389,8 +381,7 @@ class SettingsDialog(QDialog):
                 "debug_mode":                   self._debug_mode.isChecked(),
             },
             "api_keys": {
-                "openweather": ow_key,
-                "openaq":      oaq_key,
+                "openaq": oaq_key,
             },
         })
         self.accept()

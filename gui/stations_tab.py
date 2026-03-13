@@ -2,6 +2,9 @@
 
 import json
 import math
+import tempfile
+import os
+from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -9,7 +12,9 @@ from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
     QDialog, QFormLayout, QLineEdit, QDialogButtonBox, QMessageBox
 )
-from PyQt5.QtCore import Qt, QUrl
+from PyQt5.QtCore import Qt, QUrl, QTimer
+from datetime import datetime
+from zoneinfo import ZoneInfo
 import logging
 from utils.parameter_formatter import format_parameter_name
 from analytics.warnings import WarningDetector
@@ -24,13 +29,9 @@ except ImportError:
 logger = logging.getLogger("WeatherApp.gui.stations_tab")
 
 # ---------------------------------------------------------------------------
-# Inversion score configuration — the complete set of non-derived constants.
-# These are sensitivity/tolerance parameters, not physical thresholds.
+# Calibration parameters are now read from DB (calibration_parameters table).
+# No hardcoded constants remain — all values derive from database.
 # ---------------------------------------------------------------------------
-INVERSION_P_LOW  = 5    # lower winsorization percentile
-INVERSION_P_HIGH = 95   # upper winsorization percentile
-INVERSION_WIND_WEIGHT     = 0.6
-INVERSION_HUMIDITY_WEIGHT = 0.4
 
 
 def _clamp(value: float, lo: float, hi: float) -> float:
@@ -59,6 +60,94 @@ class MapDataBuilder:
     def __init__(self, db, warning_detector: WarningDetector):
         self.db = db
         self.detector = warning_detector
+        self._calibration_cache = None  # Cache calibration params per build() call
+    
+    def _get_calibration_params(self) -> Dict[str, float]:
+        """
+        Get all calibration parameters from DB. Fail loudly if any required key is missing.
+        
+        Returns:
+            Dictionary of calibration parameters
+            
+        Raises:
+            RuntimeError: If any required calibration parameter is missing from DB
+        """
+        if self._calibration_cache is None:
+            params = self.db.get_all_calibration_parameters()
+            
+            # Required keys for inversion model
+            required_inversion = [
+                'inversion_p_low', 'inversion_p_high',
+                'inversion_wind_weight', 'inversion_humidity_weight'
+            ]
+            # Required keys for IDW
+            required_idw = [
+                'idw_power', 'idw_max_r_factor', 'idw_scale_percentile'
+            ]
+            
+            missing = []
+            for key in required_inversion + required_idw:
+                if key not in params or params[key] is None:
+                    missing.append(key)
+            
+            if missing:
+                error_msg = (
+                    f"Missing required calibration parameters in DB: {', '.join(missing)}. "
+                    f"Run migration_add_calibration_parameters.sql to seed the calibration_parameters table."
+                )
+                logger.error(error_msg)
+                raise RuntimeError(error_msg)
+            
+            # Validate weights sum to 1.0
+            wind_w = params.get('inversion_wind_weight', 0)
+            hum_w = params.get('inversion_humidity_weight', 0)
+            if abs(wind_w + hum_w - 1.0) > 0.01:
+                logger.warning(
+                    f"inversion_wind_weight ({wind_w}) + inversion_humidity_weight ({hum_w}) != 1.0. "
+                    f"Normalizing to sum to 1.0."
+                )
+                total = wind_w + hum_w
+                if total > 0:
+                    params['inversion_wind_weight'] = wind_w / total
+                    params['inversion_humidity_weight'] = hum_w / total
+            
+            self._calibration_cache = params
+        
+        return self._calibration_cache
+
+    def _get_map_extent(self) -> Tuple[float, float, float, float]:
+        """
+        Get map/heatmap geographic extent (lat_min, lat_max, lon_min, lon_max).
+        From calibration_parameters if all four keys present and valid; otherwise
+        bbox of all cities in DB. No hardcoded coordinates.
+        """
+        try:
+            lat_min = self.db.get_calibration_parameter("map_extent_lat_min")
+            lat_max = self.db.get_calibration_parameter("map_extent_lat_max")
+            lon_min = self.db.get_calibration_parameter("map_extent_lon_min")
+            lon_max = self.db.get_calibration_parameter("map_extent_lon_max")
+            if all(v is not None for v in (lat_min, lat_max, lon_min, lon_max)):
+                lat_min, lat_max = float(lat_min), float(lat_max)
+                lon_min, lon_max = float(lon_min), float(lon_max)
+                if lat_min < lat_max and lon_min < lon_max:
+                    return (lat_min, lat_max, lon_min, lon_max)
+        except (TypeError, ValueError):
+            pass
+        # Fallback: bbox from all cities in DB
+        all_cities = self.db.get_all_cities()
+        lats = [c["latitude"] for c in all_cities if c.get("latitude") is not None]
+        lons = [c["longitude"] for c in all_cities if c.get("longitude") is not None]
+        if lats and lons:
+            lat_min, lat_max = min(lats), max(lats)
+            lon_min, lon_max = min(lons), max(lons)
+            pad_lat = (lat_max - lat_min) * 0.05
+            pad_lon = (lon_max - lon_min) * 0.05
+            return (
+                lat_min - pad_lat, lat_max + pad_lat,
+                lon_min - pad_lon, lon_max + pad_lon,
+            )
+        # No cities: return a minimal default box (avoid division by zero later)
+        return (55.0, 56.0, 13.0, 14.0)
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -81,12 +170,20 @@ class MapDataBuilder:
         all_sensors  = self.db.get_all_sensors()
         national_7d  = self.db.get_national_pm25_7day_average()
 
+        # ---- Map extent (DB-driven: calibration or bbox of all cities) ----
+        map_extent = self._get_map_extent()  # (lat_min, lat_max, lon_min, lon_max)
+
+        # ---- Get calibration parameters from DB ----
+        calib = self._get_calibration_params()
+        inversion_p_low = calib['inversion_p_low']
+        inversion_p_high = calib['inversion_p_high']
+        
         # ---- Fetch winsorized bounds once for both parameters ----
         wind_lo, wind_hi = self.db.get_parameter_winsorized_bounds(
-            "wind_speed", INVERSION_P_LOW, INVERSION_P_HIGH
+            "wind_speed", inversion_p_low, inversion_p_high
         )
         hum_lo, hum_hi = self.db.get_parameter_winsorized_bounds(
-            "humidity", INVERSION_P_LOW, INVERSION_P_HIGH
+            "humidity", inversion_p_low, inversion_p_high
         )
 
         bounds_available = (
@@ -112,7 +209,7 @@ class MapDataBuilder:
         score_metadata = {
             "wind_bounds":      [wind_lo, wind_hi],
             "humidity_bounds":  [hum_lo,  hum_hi],
-            "percentile_range": [INVERSION_P_LOW, INVERSION_P_HIGH],
+            "percentile_range": [inversion_p_low, inversion_p_high],
             "data_rows_used":   data_rows_used,
             "bounds_available": bounds_available,
         }
@@ -190,14 +287,131 @@ class MapDataBuilder:
         # ---- Section D: station density ----
         self._compute_density(cities_out)
 
+        # ---- Diagnostic: trend point count ----
+        total_trend = sum(len(c["trend_24h"]) for c in cities_out)
+        logger.info(
+            f"[Heatmap] trend_24h: {total_trend:,} points "
+            f"across {len(cities_out)} cities "
+            f"(avg {total_trend // max(len(cities_out), 1)} per city)"
+        )
+
         # ---- Format sensors for raw marker layer ----
         sensors_out = self._format_sensors(all_sensors)
+
+        # ---- Section E: IDW grid + colour scale anchors ----
+        calib = self._get_calibration_params()
+        idw_scale_percentile = calib['idw_scale_percentile']
+        
+        idw_grid, idw_meta = self._compute_idw_grid(valid_cities, extent=map_extent)
+        if idw_grid:
+            _vals        = sorted(row[2] for row in idw_grid)
+            _idx         = min(int(len(_vals) * idw_scale_percentile / 100), len(_vals) - 1)
+            idw_max      = _vals[_idx]   # colour scale anchor at idw_scale_percentile
+            idw_true_max = _vals[-1]     # actual grid maximum — UI clamp indicator only
+        else:
+            idw_max      = 1.0
+            idw_true_max = 1.0
+
+        logger.info(
+            f"[Heatmap] IDW scale: p{idw_scale_percentile}={idw_max:.2f} µg/m³  "
+            f"true_max={idw_true_max:.2f} µg/m³"
+        )
+
+        # ---- Section F: Solar, Storm, and Lightning layers ----
+        solar_layer = self._build_solar_layer(cities_out)
+        storm_layer = self._build_storm_layer(cities_out)
+        lightning_layer = self._build_lightning_layer()
+        
+        # ---- Compute IDW grids for solar and storm layers ----
+        # Prepare cities with solar_index for IDW computation
+        cities_with_solar = []
+        for city in cities_out:
+            city_id = city.get("city_id")
+            if city_id:
+                indices = self.db.get_latest_analytical_indices(city_id)
+                if indices and indices.get('solar_index') is not None:
+                    city_copy = city.copy()
+                    city_copy['solar_index'] = indices['solar_index']
+                    cities_with_solar.append(city_copy)
+        
+        # Prepare cities with storm_risk for IDW computation
+        cities_with_storm = []
+        for city in cities_out:
+            city_id = city.get("city_id")
+            if city_id:
+                indices = self.db.get_latest_analytical_indices(city_id)
+                if indices and indices.get('storm_risk') is not None:
+                    city_copy = city.copy()
+                    city_copy['storm_risk'] = indices['storm_risk']
+                    cities_with_storm.append(city_copy)
+        
+        # Compute IDW grids (same geographic extent as PM2.5 heatmap)
+        solar_idw_grid, solar_idw_meta = self._compute_layer_idw_grid(
+            cities_with_solar, 'solar_index', 'solar', extent=map_extent
+        )
+        storm_idw_grid, storm_idw_meta = self._compute_layer_idw_grid(
+            cities_with_storm, 'storm_risk', 'storm', extent=map_extent
+        )
+        
+        # ---- Compute percentile-based scaling for all layers ----
+        def _compute_percentile_scale(values: List[float], p_low: float = 5.0, p_high: float = 95.0):
+            """Compute percentile-based scale bounds."""
+            if not values:
+                return None, None
+            sorted_vals = sorted(values)
+            n = len(sorted_vals)
+            idx_low = max(0, int(n * p_low / 100))
+            idx_high = min(n - 1, int(n * p_high / 100))
+            return sorted_vals[idx_low], sorted_vals[idx_high]
+        
+        # PM2.5 scaling (existing - using idw_scale_percentile)
+        pm25_p5, pm25_p95 = None, None
+        if idw_grid:
+            pm25_values = [row[2] for row in idw_grid]
+            pm25_p5, pm25_p95 = _compute_percentile_scale(pm25_values, 5.0, idw_scale_percentile)
+        
+        # Solar scaling (p5-p95)
+        solar_p5, solar_p95 = None, None
+        if solar_idw_grid:
+            solar_values = [row[2] for row in solar_idw_grid]
+            solar_p5, solar_p95 = _compute_percentile_scale(solar_values, 5.0, 95.0)
+        
+        # Storm scaling (p5-p95)
+        storm_p5, storm_p95 = None, None
+        if storm_idw_grid:
+            storm_values = [row[2] for row in storm_idw_grid]
+            storm_p5, storm_p95 = _compute_percentile_scale(storm_values, 5.0, 95.0)
+        
+        # Build timestamp for cache-busting
+        build_timestamp = datetime.now(ZoneInfo("Europe/Stockholm"))
 
         return {
             "cities":         cities_out,
             "sensors":        sensors_out,
             "cluster_alerts": cluster_alerts,
             "score_metadata": score_metadata,
+            "map_extent":     {"lat_min": map_extent[0], "lat_max": map_extent[1], "lon_min": map_extent[2], "lon_max": map_extent[3]},
+            "idw_grid":       idw_grid,
+            "idw_meta":       idw_meta,
+            "idw_max":        idw_max,
+            "idw_true_max":   idw_true_max,
+            "idw_scale_percentile": idw_scale_percentile,  # For JS template
+            "pm25_p5":        pm25_p5,
+            "pm25_p95":       pm25_p95,
+            "solar_layer":    solar_layer,
+            "solar_idw_grid": solar_idw_grid,
+            "solar_idw_meta": solar_idw_meta,
+            "solar_p5":       solar_p5,
+            "solar_p95":      solar_p95,
+            "storm_layer":    storm_layer,
+            "storm_idw_grid": storm_idw_grid,
+            "storm_idw_meta": storm_idw_meta,
+            "storm_p5":       storm_p5,
+            "storm_p95":      storm_p95,
+            "storm_layer_active": len(storm_layer) > 0,  # Flag for JS conditional rendering
+            "lightning_layer": lightning_layer,
+            "build_timestamp": build_timestamp.isoformat(),
+            "data_freshness_seconds": 0,  # Always fresh
         }
 
     # ------------------------------------------------------------------
@@ -240,12 +454,17 @@ class MapDataBuilder:
             )
             return None
 
+        # Get calibration weights from DB
+        calib = self._get_calibration_params()
+        wind_weight = calib['inversion_wind_weight']
+        humidity_weight = calib['inversion_humidity_weight']
+
         wind_norm = _clamp((wind_speed - wind_lo) / wind_range, 0.0, 1.0)
         hum_norm  = _clamp((humidity   - hum_lo)  / hum_range,  0.0, 1.0)
 
         score = (
-            (1.0 - wind_norm) * INVERSION_WIND_WEIGHT
-            + hum_norm        * INVERSION_HUMIDITY_WEIGHT
+            (1.0 - wind_norm) * wind_weight
+            + hum_norm        * humidity_weight
         ) * 100.0
 
         return round(score, 1)
@@ -333,6 +552,197 @@ class MapDataBuilder:
             city["low_density"]    = count < 2
 
     # ------------------------------------------------------------------
+    # Section E — IDW grid interpolation
+    # ------------------------------------------------------------------
+
+    def _compute_idw_grid(
+        self,
+        valid_cities: List[Dict],
+        extent: Optional[Tuple[float, float, float, float]] = None,
+    ) -> Tuple[List[List[float]], Dict]:
+        """
+        Inverse Distance Weighting interpolation over a regular grid.
+        Bounding box: from optional extent (lat_min, lat_max, lon_min, lon_max),
+        or from valid_cities + 5% padding. Power and max_r_factor from DB.
+
+        Returns:
+            Tuple of (grid, meta). Grid cells without any station within max_r are omitted.
+        """
+        if not valid_cities:
+            return [], {}
+
+        lats = [c["latitude"]  for c in valid_cities]
+        lons = [c["longitude"] for c in valid_cities]
+        vals = [c["pm25_24h"]  for c in valid_cities]
+        n    = len(valid_cities)
+
+        if extent is not None:
+            lat_min, lat_max, lon_min, lon_max = extent
+            # Optional 5% padding so edges are not clipped
+            lat_pad = (lat_max - lat_min) * 0.05
+            lon_pad = (lon_max - lon_min) * 0.05
+            lat_min -= lat_pad
+            lat_max += lat_pad
+            lon_min -= lon_pad
+            lon_max += lon_pad
+        else:
+            # Bounding box: actual station extents + 5% proportional padding on each side
+            lat_min, lat_max = min(lats), max(lats)
+            lon_min, lon_max = min(lons), max(lons)
+            lat_pad = (lat_max - lat_min) * 0.05
+            lon_pad = (lon_max - lon_min) * 0.05
+            lat_min -= lat_pad
+            lat_max += lat_pad
+            lon_min -= lon_pad
+            lon_max += lon_pad
+
+        # Grid resolution: scales with station density, bounded [80, 150] for better smoothing
+        # Higher resolution reduces visible bands and improves edge smoothness
+        grid_n = max(80, min(150, int(math.sqrt(n) * 10)))
+        
+        # Get IDW parameters from DB
+        calib = self._get_calibration_params()
+        idw_power = calib['idw_power']
+        idw_max_r_factor = calib['idw_max_r_factor']
+        
+        # Max IDW influence radius: tightened by idw_max_r_factor so each
+        # station covers roughly its Voronoi cell without excessive bleed.
+        diag  = math.sqrt((lat_max - lat_min) ** 2 + (lon_max - lon_min) ** 2)
+        max_r = diag / (math.sqrt(n) * idw_max_r_factor)
+
+        lat_step = (lat_max - lat_min) / grid_n
+        lon_step = (lon_max - lon_min) / grid_n
+
+        grid = []
+        for i in range(grid_n):
+            glat = lat_min + i * lat_step
+            for j in range(grid_n):
+                glon = lon_min + j * lon_step
+                num = den = 0.0
+                for slat, slon, sval in zip(lats, lons, vals):
+                    d = math.sqrt((glat - slat) ** 2 + (glon - slon) ** 2)
+                    if d < 1e-9:          # coincident with station — exact value
+                        num, den = sval, 1.0
+                        break
+                    if d <= max_r:
+                        w    = 1.0 / (d ** idw_power)   # idw_power controls locality (from DB)
+                        num += w * sval
+                        den += w
+                if den > 0:
+                    grid.append([
+                        round(glat, 5),
+                        round(glon, 5),
+                        round(num / den, 3),
+                    ])
+
+        logger.info(
+            f"[Heatmap] IDW grid: {grid_n}×{grid_n} cells, "
+            f"{len(grid)} non-empty, n_stations={n}, max_r={max_r:.3f}°"
+        )
+
+        meta = {
+            "lat_min":  lat_min,
+            "lat_max":  lat_max,
+            "lon_min":  lon_min,
+            "lon_max":  lon_max,
+            "grid_n":   grid_n,
+            "lat_step": lat_step,
+            "lon_step": lon_step,
+        }
+        return grid, meta
+
+    def _compute_layer_idw_grid(
+        self,
+        cities: List[Dict],
+        value_key: str,
+        layer_name: str,
+        extent: Optional[Tuple[float, float, float, float]] = None,
+    ) -> Tuple[List[List[float]], Dict]:
+        """
+        Compute IDW grid for a specific layer (solar, storm, etc.).
+        Bounding box: from optional extent, or from cities + 5%% padding.
+        """
+        # Filter cities with valid values
+        valid_cities = [c for c in cities if c.get(value_key) is not None]
+        if not valid_cities:
+            return [], {}
+        
+        lats = [c["latitude"] for c in valid_cities]
+        lons = [c["longitude"] for c in valid_cities]
+        vals = [c[value_key] for c in valid_cities]
+        n = len(valid_cities)
+        
+        if extent is not None:
+            lat_min, lat_max, lon_min, lon_max = extent
+            lat_pad = (lat_max - lat_min) * 0.05
+            lon_pad = (lon_max - lon_min) * 0.05
+            lat_min -= lat_pad
+            lat_max += lat_pad
+            lon_min -= lon_pad
+            lon_max += lon_pad
+        else:
+            # Bounding box: actual station extents + 5% proportional padding
+            lat_min, lat_max = min(lats), max(lats)
+            lon_min, lon_max = min(lons), max(lons)
+            lat_pad = (lat_max - lat_min) * 0.05
+            lon_pad = (lon_max - lon_min) * 0.05
+            lat_min -= lat_pad
+            lat_max += lat_pad
+            lon_min -= lon_pad
+            lon_max += lon_pad
+        
+        # Grid resolution: scales with station density, bounded [80, 150] for better smoothing
+        grid_n = max(80, min(150, int(math.sqrt(n) * 10)))
+        
+        # Get layer-specific IDW parameters (or use defaults)
+        calib = self._get_calibration_params()
+        idw_power_key = f'{layer_name}_idw_power'
+        idw_max_r_factor_key = f'{layer_name}_idw_max_r_factor'
+        
+        idw_power = calib.get(idw_power_key) or calib.get('idw_power', 2.3)
+        idw_max_r_factor = calib.get(idw_max_r_factor_key) or calib.get('idw_max_r_factor', 1.3)
+        
+        # Max IDW influence radius
+        diag = math.sqrt((lat_max - lat_min) ** 2 + (lon_max - lon_min) ** 2)
+        max_r = diag / (math.sqrt(n) * idw_max_r_factor)
+        
+        lat_step = (lat_max - lat_min) / grid_n
+        lon_step = (lon_max - lon_min) / grid_n
+        
+        grid = []
+        for i in range(grid_n):
+            glat = lat_min + i * lat_step
+            for j in range(grid_n):
+                glon = lon_min + j * lon_step
+                num = den = 0.0
+                for slat, slon, sval in zip(lats, lons, vals):
+                    d = math.sqrt((glat - slat) ** 2 + (glon - slon) ** 2)
+                    if d < 1e-9:  # coincident with station
+                        num, den = sval, 1.0
+                        break
+                    if d <= max_r:
+                        w = 1.0 / (d ** idw_power)
+                        num += w * sval
+                        den += w
+                if den > 0:
+                    grid.append([
+                        round(glat, 5),
+                        round(glon, 5),
+                        round(num / den, 3),
+                    ])
+        
+        meta = {
+            "lat_min": lat_min,
+            "lat_max": lat_max,
+            "lon_min": lon_min,
+            "lon_max": lon_max,
+            "grid_n": grid_n,
+            "lat_step": lat_step,
+            "lon_step": lon_step,
+        }
+        return grid, meta
+
+    # ------------------------------------------------------------------
     # Sensor formatter
     # ------------------------------------------------------------------
 
@@ -349,6 +759,170 @@ class MapDataBuilder:
             fs["formatted_timestamp"] = _format_timestamp(s.get("last_updated"))
             out.append(fs)
         return out
+    
+    # ------------------------------------------------------------------
+    # Solar, Storm, and Lightning layers
+    # ------------------------------------------------------------------
+    
+    def _build_solar_layer(self, cities: List[Dict]) -> List[Dict]:
+        """
+        Build solar layer from analytical indices.
+        
+        Returns:
+            List of {lat, lon, solar_index} points
+        """
+        layer = []
+        for city in cities:
+            city_id = city.get("city_id")
+            if not city_id:
+                continue
+            
+            # Get latest analytical indices
+            indices = self.db.get_latest_analytical_indices(city_id)
+            if indices and indices.get('solar_index') is not None:
+                layer.append({
+                    "lat": city.get("latitude"),
+                    "lon": city.get("longitude"),
+                    "solar_index": indices['solar_index']
+                })
+        return layer
+    
+    def _should_render_storm_layer(self, cities: List[Dict]) -> bool:
+        """
+        Determine if storm layer should be rendered based on dynamic percentile thresholds.
+        
+        Returns True only if:
+        - lightning_count > p75 of current dataset OR
+        - CAPE > p75 of current dataset OR  
+        - storm_risk > p75 of current dataset
+        
+        All thresholds computed dynamically from current data.
+        """
+        try:
+            # Get lightning events count
+            lightning_events = self.db.get_lightning_events(hours=24)
+            lightning_count = len(lightning_events) if lightning_events else 0
+            
+            # Get CAPE values from latest weather_data
+            conn = self.db.get_connection()
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT cape FROM weather_data 
+                WHERE cape IS NOT NULL 
+                ORDER BY timestamp DESC 
+                LIMIT 100
+            """)
+            cape_values = [row[0] for row in cursor.fetchall() if row[0] is not None]
+            
+            # Get storm_risk values
+            storm_risks = []
+            for city in cities:
+                city_id = city.get('city_id')
+                if city_id:
+                    indices = self.db.get_latest_analytical_indices(city_id)
+                    if indices and indices.get('storm_risk') is not None:
+                        storm_risks.append(indices['storm_risk'])
+            
+            # Use fixed thresholds as specified by user
+            # lightning_count > 0 (any lightning event)
+            # CAPE > 100 J/kg
+            # Note: radar reflectivity not yet available in current data model
+            
+            lightning_threshold = 0  # Any lightning event
+            cape_threshold = 100.0  # J/kg
+            
+            # Check if any threshold is exceeded
+            should_render = (
+                lightning_count > lightning_threshold or
+                (cape_values and max(cape_values) > cape_threshold)
+            )
+            
+            logger.debug(
+                f"[Storm Layer] Threshold check: lightning={lightning_count} (thresh={lightning_threshold}), "
+                f"CAPE max={max(cape_values) if cape_values else 0} (thresh={cape_threshold}), "
+                f"should_render={should_render}"
+            )
+            
+            return should_render
+            
+        except Exception as e:
+            logger.warning(f"Error checking storm layer thresholds: {e}")
+            return False  # Default to not rendering on error
+    
+    def _build_storm_layer(self, cities: List[Dict]) -> List[Dict]:
+        """
+        Build storm layer from analytical indices.
+        
+        Only includes cities if storm layer should be rendered (thresholds met).
+        
+        Returns:
+            List of {lat, lon, storm_risk} points, or empty list if thresholds not met
+        """
+        # Check if we should render storm layer
+        if not self._should_render_storm_layer(cities):
+            logger.debug("[Storm Layer] Thresholds not met, returning empty layer")
+            return []  # Empty layer = no rendering in JS
+        
+        layer = []
+        for city in cities:
+            city_id = city.get("city_id")
+            if not city_id:
+                continue
+            
+            # Get latest analytical indices
+            indices = self.db.get_latest_analytical_indices(city_id)
+            if indices and indices.get('storm_risk') is not None:
+                layer.append({
+                    "lat": city.get("latitude"),
+                    "lon": city.get("longitude"),
+                    "storm_risk": indices['storm_risk']
+                })
+        return layer
+    
+    def _build_lightning_layer(self) -> List[Dict]:
+        """
+        Build lightning layer from lightning_events table.
+        
+        Returns:
+            List of {lat, lon, timestamp, intensity} strike markers
+        """
+        try:
+            # Get lightning display hours from calibration
+            display_hours = self.db.get_calibration_parameter('lightning_display_hours')
+            if display_hours is None:
+                display_hours = 24.0
+            
+            conn = self.db.get_connection()
+            cursor = conn.cursor()
+            cursor.row_factory = lambda cursor, row: {
+                'latitude': row[0],
+                'longitude': row[1],
+                'timestamp': row[2],
+                'intensity': row[3]
+            }
+            
+            cursor.execute("""
+                SELECT latitude, longitude, timestamp, intensity
+                FROM lightning_events
+                WHERE timestamp >= datetime('now', '-' || ? || ' hours')
+                ORDER BY timestamp DESC
+            """, (display_hours,))
+            
+            rows = cursor.fetchall()
+            layer = []
+            for row in rows:
+                layer.append({
+                    "lat": row['latitude'],
+                    "lon": row['longitude'],
+                    "timestamp": str(row['timestamp']),
+                    "intensity": row['intensity']
+                })
+            
+            return layer
+            
+        except Exception as e:
+            logger.warning(f"Error building lightning layer: {e}")
+            return []
 
 
 # ---------------------------------------------------------------------------
@@ -379,6 +953,7 @@ def _format_timestamp(timestamp) -> str:
             return str(timestamp)
     except Exception:
         return "Okänd"
+
 
 
 # ---------------------------------------------------------------------------
@@ -467,7 +1042,17 @@ class StationsTab(QWidget):
         super().__init__()
         self.controller = controller
         self._sensors_loaded = False
+        # Set to True just before load() is called so that the handler
+        # can ignore the spurious loadFinished(False) that QWebEngine emits
+        # when the implicit about:blank navigation is aborted by the new load.
+        self._expecting_html_load = False
+        # Path to the temp HTML file currently loaded in the map view.
+        # Kept so the old file can be deleted when a new one is written.
+        self._map_html_tmp: Optional[str] = None
+        self.last_refresh_time = None
+        self.refresh_timer = None
         self._init_ui()
+        self._setup_auto_refresh()
 
     def _init_ui(self):
         layout = QVBoxLayout(self)
@@ -489,6 +1074,7 @@ class StationsTab(QWidget):
         layout.addLayout(toolbar)
 
         self.map_view = QWebEngineView()
+        self.map_view.loadFinished.connect(self._on_map_load_finished)
         layout.addWidget(self.map_view)
 
         self._load_map()
@@ -508,32 +1094,17 @@ class StationsTab(QWidget):
             payload = builder.build()
         except Exception as e:
             logger.error(f"MapDataBuilder.build() failed: {e}")
-            payload = {"cities": [], "sensors": [], "cluster_alerts": [], "score_metadata": {}}
+            payload = {
+                "cities": [], "sensors": [],
+                "cluster_alerts": [], "score_metadata": {},
+                "idw_grid": [], "idw_max": 1.0, "idw_true_max": 1.0,
+            }
 
-        html = self._generate_map_html(payload)
-        self.map_view.setHtml(html)
-        self.map_view.page().titleChanged.connect(self._on_title_changed)
-        self._sensors_loaded = True
+        cities = payload.get("cities", [])
+        n_heat = sum(1 for c in cities if c.get("pm25_24h") is not None)
+        logger.info(f"[Heatmap] cities with pm25_24h: {n_heat}/{len(cities)}")
 
-    def _refresh_map(self):
-        logger.info("Uppdaterar analytisk karta")
-        self._load_map()
-
-    # ------------------------------------------------------------------
-    # HTML / Leaflet generation
-    # ------------------------------------------------------------------
-
-    def _generate_map_html(self, payload: Dict) -> str:
-        """
-        Generate the full Leaflet HTML from the enriched payload.
-
-        Python injects one JSON object.  JavaScript only renders.
-        No logic crosses the boundary in either direction.
-        """
-        cities  = payload.get("cities", [])
-        sensors = payload.get("sensors", [])
-
-        # Compute map centre from cities with coordinates
+        # Map centre and bounds (bounds from payload map_extent for fitBounds)
         lats = [c["latitude"]  for c in cities if c.get("latitude")  is not None]
         lons = [c["longitude"] for c in cities if c.get("longitude") is not None]
         if lats and lons:
@@ -541,8 +1112,209 @@ class StationsTab(QWidget):
             center_lon = sum(lons) / len(lons)
         else:
             center_lat, center_lon = 62.0, 15.0
+        map_extent = payload.get("map_extent")  # { lat_min, lat_max, lon_min, lon_max } or None
 
+        # Serialise the full payload here so we can measure its size before
+        # generating the HTML.  The same string is embedded verbatim in the
+        # HTML — no double serialisation.
         payload_json = json.dumps(payload, default=str)
+
+        opacity_int = int(self.controller.config.get_setting("heatmap_opacity", 70))
+        try:
+            html = self._generate_map_html(
+                payload_json, opacity_int, center_lat, center_lon, map_extent=map_extent
+            )
+        except Exception as exc:
+            logger.error(f"[Heatmap] _generate_map_html failed: {exc}", exc_info=True)
+            return
+
+        logger.info(
+            f"[Heatmap] payload: {len(payload_json):,} B JSON  "
+            f"/ {len(html):,} B HTML  "
+            f"/ {len(html) / 1024 / 1024:.2f} MB total"
+        )
+        # setHtml() has a hard 2 MB limit — large payloads (200+ cities) are
+        # silently dropped and loadFinished(True) never fires.
+        # Write to a named temp file and load it via file:// URL instead.
+        try:
+            tmp_fd, tmp_path = tempfile.mkstemp(suffix=".html", prefix="weatherapp_map_")
+            with os.fdopen(tmp_fd, "w", encoding="utf-8") as fh:
+                fh.write(html)
+        except OSError as exc:
+            logger.error(f"[Heatmap] failed to write map temp file: {exc}")
+            return
+
+        # Delete the previous temp file (best-effort — Windows may refuse if
+        # the web engine still holds a file handle; ignore that error).
+        if self._map_html_tmp and os.path.exists(self._map_html_tmp):
+            try:
+                os.remove(self._map_html_tmp)
+            except OSError:
+                pass
+        self._map_html_tmp = tmp_path
+
+        logger.info(f"[Heatmap] loading map from temp file ({len(html):,} bytes): {tmp_path}")
+
+        # Arm the flag BEFORE load() so that the handler is ready for the
+        # loadFinished(True) that follows the about:blank abort.
+        self._expecting_html_load = True
+        self.map_view.load(QUrl.fromLocalFile(tmp_path))
+        self.map_view.page().titleChanged.connect(self._on_title_changed)
+        self._sensors_loaded = True
+
+    def _setup_auto_refresh(self):
+        """Setup automatic map refresh on data updates and periodic timer."""
+        # Connect to data_updated signal
+        self.controller.data_updated.connect(self._on_data_updated)
+        
+        # Setup periodic timer
+        refresh_interval = self.controller.db.get_calibration_parameter('map_refresh_interval_seconds')
+        if refresh_interval is None:
+            refresh_interval = 90.0  # Default: 90 seconds
+        
+        self.refresh_timer = QTimer()
+        self.refresh_timer.timeout.connect(self._refresh_map)
+        self.refresh_timer.start(int(refresh_interval * 1000))
+        
+        logger.info(f"[Heatmap] Auto-refresh enabled: signal-driven + periodic ({refresh_interval}s)")
+    
+    def _on_data_updated(self, city_id: int, data_id: int):
+        """Handle data_updated signal with debouncing."""
+        # Debounce: only refresh if last refresh was > 5 seconds ago
+        now = datetime.now(ZoneInfo("Europe/Stockholm"))
+        if self.last_refresh_time is None or (now - self.last_refresh_time).total_seconds() > 5:
+            logger.debug(f"[Heatmap] Data updated signal received (city_id={city_id}), refreshing map")
+            self._refresh_map()
+            self.last_refresh_time = now
+    
+    def _refresh_map(self):
+        """Refresh map display from database only."""
+        logger.info("Uppdaterar analytisk karta från databas")
+        self._load_map()
+
+    def _on_map_load_finished(self, ok: bool) -> None:
+        """
+        Called by QWebEngineView.loadFinished for every navigation, including
+        the implicit about:blank that QWebEngine starts on creation.
+
+        When setHtml() is called it aborts that about:blank navigation which
+        emits loadFinished(False).  We MUST NOT treat that as a real failure:
+        the genuine loadFinished(True) for our HTML fires immediately after.
+
+        The _expecting_html_load flag is armed by _load_map() just before
+        setHtml() so that any event received while the flag is False is
+        unconditionally discarded (stale initial-blank events before our first
+        setHtml call).
+
+        ok=False with flag armed = about:blank abort → warn, keep flag set,
+                                    wait for the True that follows.
+        ok=True  with flag armed = our HTML loaded  → consume flag, inject.
+        """
+        if not self._expecting_html_load:
+            # Stale event from before we ever called setHtml — discard.
+            return
+        if not ok:
+            # Very likely the about:blank abort.  Log a warning but leave the
+            # flag set so the real ok=True still triggers injection.
+            logger.warning("[Heatmap] loadFinished(False) received — "
+                           "likely about:blank abort; waiting for ok=True")
+            return
+        # Genuine successful load of our HTML.
+        self._expecting_html_load = False
+        logger.info("[Heatmap] loadFinished(True) — scheduling initHeatOverlay via Qt event loop")
+        QTimer.singleShot(0, self._inject_heat_layer)
+
+    def _inject_heat_layer(self) -> None:
+        """
+        Phase 1: read-only snapshot of the full JS state via runJavaScript
+        callback.  console.log is silently discarded by QWebEngine — only
+        uncaught exceptions reach Python as 'js: ...' lines.  The callback
+        is the only reliable channel for getting values back to Python.
+
+        The snapshot is pure read — no map.invalidateSize() side-effect.
+        Every variable access is guarded with typeof so a missing variable
+        returns a descriptive string instead of throwing.
+        QWebEngine returns the plain JS object directly as a Python dict.
+        """
+        self.map_view.page().runJavaScript(
+            """
+            (function() {
+                return {
+                    L_exists:        typeof L !== "undefined",
+                    idw_grid_len:    (typeof PAYLOAD !== "undefined" && PAYLOAD.idw_grid)
+                                         ? PAYLOAD.idw_grid.length : "no PAYLOAD.idw_grid",
+                    idw_meta_ok:     (typeof PAYLOAD !== "undefined" && PAYLOAD.idw_meta)
+                                         ? JSON.stringify(PAYLOAD.idw_meta) : "no PAYLOAD.idw_meta",
+                    heatMax_val:     typeof heatMax !== "undefined" ? heatMax : "undefined",
+                    map_exists:      typeof map !== "undefined",
+                    map_size:        typeof map !== "undefined" ? map.getSize() : "no map",
+                    map_container_w: typeof map !== "undefined" ? map.getContainer().clientWidth : "no map"
+                };
+            })()
+            """,
+            self._on_heat_diagnostics
+        )
+
+    def _on_heat_diagnostics(self, result) -> None:
+        """
+        Phase 2: log each field of the snapshot individually so the output is
+        readable at a glance, then schedule initHeatOverlay() via a second
+        QTimer.singleShot(0) hop.
+
+        Two Qt event-loop cycles are required:
+          - Cycle 1 (in _on_map_load_finished): lets the page script finish
+          - Cycle 2 (here): lets Qt's layout engine assign pixel dimensions
+            to the QWebEngineView container before the canvas renders
+        """
+        logger.info("[Heatmap] pre-creation diagnostics:")
+        if isinstance(result, dict):
+            for k, v in result.items():
+                logger.info(f"  {k}: {v}")
+        else:
+            logger.info(f"  raw: {result}")
+
+        QTimer.singleShot(
+            0,
+            lambda: self.map_view.page().runJavaScript("initHeatOverlay();")
+        )
+        logger.info("[Heatmap] initHeatOverlay() scheduled (second QTimer hop)")
+
+    # ------------------------------------------------------------------
+    # HTML / Leaflet generation
+    # ------------------------------------------------------------------
+
+    def _generate_map_html(
+        self,
+        payload_json: str,
+        opacity_int: int,
+        center_lat: float,
+        center_lon: float,
+        map_extent: Optional[Dict] = None,
+    ) -> str:
+        """
+        Generate the full Leaflet HTML.
+        If map_extent is provided (lat_min, lat_max, lon_min, lon_max), the map
+        uses fitBounds so the full extent is visible; otherwise setView(center, 6).
+        """
+        # Normalize opacity for JS canvas alpha (expects 0.0–1.0)
+        opacity_float = round(opacity_int / 100.0, 2)
+        # Bounds for fitBounds (when map_extent from payload)
+        has_bounds = (
+            map_extent is not None
+            and all(map_extent.get(k) is not None for k in ("lat_min", "lat_max", "lon_min", "lon_max"))
+        )
+        if has_bounds:
+            b_lat_min = float(map_extent["lat_min"])
+            b_lat_max = float(map_extent["lat_max"])
+            b_lon_min = float(map_extent["lon_min"])
+            b_lon_max = float(map_extent["lon_max"])
+            map_init_js = f"map.fitBounds([[{b_lat_min}, {b_lon_min}], [{b_lat_max}, {b_lon_max}]], {{ padding: [20, 20] }});"
+        else:
+            b_lat_min = b_lat_max = b_lon_min = b_lon_max = 0.0  # unused
+            map_init_js = f"map.setView([{center_lat}, {center_lon}], 6);"
+
+        # No icon loading - use circleMarker for lightning markers
+        lightning_icon_data_url = ""
 
         html = f"""<!DOCTYPE html>
 <html>
@@ -550,7 +1322,6 @@ class StationsTab(QWidget):
 <meta charset="utf-8">
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-<script src="https://unpkg.com/leaflet.heat@0.2.0/dist/leaflet-heat.js"></script>
 <style>
   body  {{ margin:0; padding:0; font-family: sans-serif; }}
   #map  {{ height:100vh; width:100%; }}
@@ -599,7 +1370,11 @@ class StationsTab(QWidget):
   <span style="font-size:12px;font-weight:bold;color:#555;">Lager:</span>
   <span class="layer-btn active" id="btn-markers"  onclick="toggleLayer('markers')">Stationer</span>
   <span class="layer-btn active" id="btn-heatmap"  onclick="toggleLayer('heatmap')">Heatmap</span>
+  <span class="layer-btn" id="btn-solar"  onclick="toggleLayer('solar')">Sol</span>
+  <span class="layer-btn" id="btn-storm"  onclick="toggleLayer('storm')">Åska</span>
+  <span class="layer-btn" id="btn-lightning"  onclick="toggleLayer('lightning')">Blixtar</span>
   <span class="layer-btn active" id="btn-sensors"  onclick="toggleLayer('sensors')">Sensorer</span>
+  <div id="scale-clamp-note" style="display:none; font-size:11px; color:#b03030; margin-left:8px;"></div>
 </div>
 
 <div id="cluster-banner"></div>
@@ -613,9 +1388,13 @@ var cities        = PAYLOAD.cities        || [];
 var sensors       = PAYLOAD.sensors       || [];
 var clusterAlerts = PAYLOAD.cluster_alerts || [];
 var scoreMeta     = PAYLOAD.score_metadata || {{}};
+var solarLayer    = PAYLOAD.solar_layer   || [];
+var stormLayer    = PAYLOAD.storm_layer   || [];
+var lightningLayer = PAYLOAD.lightning_layer || [];
 
 // ── Map init ─────────────────────────────────────────────────────────────
-var map = L.map('map').setView([{center_lat}, {center_lon}], 6);
+var map = L.map('map');
+{map_init_js}
 L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
   attribution: '© OpenStreetMap contributors'
 }}).addTo(map);
@@ -623,10 +1402,15 @@ L.control.zoom({{ position: 'topright' }}).addTo(map);
 map.scrollWheelZoom.enable();
 
 // ── Layer groups ─────────────────────────────────────────────────────────
-var markerGroup  = L.layerGroup().addTo(map);
-var sensorGroup  = L.layerGroup().addTo(map);
-var heatLayer    = null;
-var layerState   = {{ markers: true, heatmap: true, sensors: true }};
+var markerGroup    = L.layerGroup().addTo(map);
+var sensorGroup    = L.layerGroup().addTo(map);
+var solarGroup     = L.layerGroup();
+var stormGroup     = L.layerGroup();
+var lightningGroup = L.layerGroup();
+var heatLayer      = null;
+var solarHeatLayer = null;
+var stormHeatLayer = null;
+var layerState     = {{ markers: true, heatmap: true, sensors: true, solar: false, storm: false, lightning: false }};
 
 // ── Sparkline SVG helper ─────────────────────────────────────────────────
 function buildSparkline(trend) {{
@@ -673,8 +1457,6 @@ function buildInvGauge(score, meta) {{
 }}
 
 // ── City markers layer ────────────────────────────────────────────────────
-var heatPoints = [];
-
 cities.forEach(function(city) {{
   var lat = city.latitude, lon = city.longitude;
   if (lat == null || lon == null) return;
@@ -710,11 +1492,6 @@ cities.forEach(function(city) {{
     fillOpacity: 0.9,
   }}).addTo(markerGroup);
 
-  // Heatmap input: [lat, lon, intensity]
-  if (pm25 != null) {{
-    heatPoints.push([lat, lon, pm25]);
-  }}
-
   // ── Analytical popup ────────────────────────────────────────────────
   var sparkline = buildSparkline(city.trend_24h);
   var invGauge  = buildInvGauge(city.inversion_score, scoreMeta);
@@ -734,7 +1511,7 @@ cities.forEach(function(city) {{
     '<div class="popup-title">' + city.city_name + '</div>' +
     '<span class="aqi-badge" style="background:' + color + '">' + city.aqi_level_name + '</span><br>' +
     '<b>PM2.5 (24h):</b> ' + pm25Str + '<br>' +
-    '<b>Temp:</b> ' + tempStr + ' &nbsp; <b>Fukt:</b> ' + humStr + ' &nbsp; <b>Vind:</b> ' + wsStr + '<br>' +
+    '<b>Temp:</b> ' + tempStr + ' &nbsp; <b>Fukt:</b> ' + humStr + ' &nbsp; <b>Vind (medel):</b> ' + wsStr + '<br>' +
     '<b>NO₂:</b> ' + no2Str + ' &nbsp; <b>O₃:</b> ' + o3Str + '<br>' +
     '<div class="sparkline-wrap">' + sparkline + '</div>' +
     invGauge +
@@ -745,24 +1522,130 @@ cities.forEach(function(city) {{
   dot.bindPopup(popupHtml, {{ maxWidth: 240 }});
 }});
 
-// ── Heatmap layer ─────────────────────────────────────────────────────────
-// leaflet.heat calls canvas.getImageData() synchronously on addTo(map).
-// Inside QWebEngineView, map.whenReady() fires before Qt's layout engine
-// has assigned real pixel dimensions to the canvas, so size.x is still 0.
-// Fix: defer with setTimeout + map.invalidateSize() so the Qt layout pass
-// completes and the canvas has non-zero dimensions before leaflet.heat runs.
-setTimeout(function() {{
+// ── Heatmap raster overlay ────────────────────────────────────────────────
+// The IDW grid (computed in Python) is rendered pixel-by-pixel on an
+// offscreen canvas, bilinearly upscaled for smoothness, then attached to
+// the map as L.imageOverlay.  This avoids the LED-dot artefact that
+// L.heatLayer produces when fed a pre-interpolated grid.
+//
+// heatMax:     Python p95 anchor — outlier-robust colour scale.
+// heatTrueMax: actual grid maximum — used only by the scale-clamp indicator.
+var heatMax     = PAYLOAD.idw_max      || 1.0;
+var heatTrueMax = PAYLOAD.idw_true_max || heatMax;
+var idwScalePct = PAYLOAD.idw_scale_percentile || 95;
+console.log("[Heatmap] idw_grid:", (PAYLOAD.idw_grid || []).length, "cells  heatMax:", heatMax, "heatTrueMax:", heatTrueMax);
+
+// ── Scale-clamp indicator ─────────────────────────────────────────────────
+// Shown only when the colour scale is clamped below the true grid maximum.
+// Informs the user that red is not the absolute max during extreme events.
+(function() {{
+  if (heatTrueMax <= heatMax) return;
+  var el = document.getElementById('scale-clamp-note');
+  if (!el) return;
+  el.style.display = 'block';
+  el.innerHTML =
+    '&#9888; Skalan visar upp till <strong>' + heatMax.toFixed(1) + '\u00a0\u00b5g/m\u00b3</strong>' +
+    ' (p' + idwScalePct + ') &mdash; faktiskt\u00a0max: <strong>' +
+    heatTrueMax.toFixed(1) + '\u00a0\u00b5g/m\u00b3</strong>';
+}})();
+
+window.addEventListener("resize", function() {{
   map.invalidateSize();
-  if (heatPoints.length > 0) {{
-    heatLayer = L.heatLayer(heatPoints, {{
-      radius:  28,
-      blur:    20,
-      maxZoom: 10,
-      max:     150,
-      gradient: {{ 0.0: '#00e400', 0.25: '#ffff00', 0.5: '#ff7e00', 0.75: '#ff0000', 1.0: '#7e0023' }}
-    }}).addTo(map);
+}});
+
+function initHeatOverlay() {{
+  map.invalidateSize();
+  var size = map.getSize();
+  if (size.x === 0 || size.y === 0) {{
+    // Qt layout has not yet assigned pixel dimensions — retry on next paint frame
+    requestAnimationFrame(initHeatOverlay);
+    return;
   }}
-}}, 300);
+
+  var grid = PAYLOAD.idw_grid;
+  var meta = PAYLOAD.idw_meta;
+  if (!grid || !grid.length || !meta) {{
+    console.error("[Heatmap] idw_grid or idw_meta missing — overlay skipped");
+    return;
+  }}
+
+  // ── AQI colour gradient stops (same palette as before) ──────────────────
+  var stops = [
+    {{ t:0.0,  r:0,   g:228, b:0   }},
+    {{ t:0.25, r:255, g:255, b:0   }},
+    {{ t:0.5,  r:255, g:126, b:0   }},
+    {{ t:0.75, r:255, g:0,   b:0   }},
+    {{ t:1.0,  r:126, g:0,   b:35  }}
+  ];
+  // Use percentile-based scaling (p5-p95) instead of just max
+  var pm25_p5 = PAYLOAD.pm25_p5;
+  var pm25_p95 = PAYLOAD.pm25_p95 || heatMax;
+  var pm25_scale_range = (pm25_p95 - pm25_p5) || 1.0;
+  
+  function valToRGB(val) {{
+    // Normalize using percentile bounds (p5-p95)
+    var t = Math.max(0, Math.min(1, (val - pm25_p5) / pm25_scale_range));
+    for (var i = 1; i < stops.length; i++) {{
+      if (t <= stops[i].t) {{
+        var s0 = stops[i-1], s1 = stops[i];
+        var f = (t - s0.t) / (s1.t - s0.t);
+        return [
+          Math.round(s0.r + f*(s1.r-s0.r)),
+          Math.round(s0.g + f*(s1.g-s0.g)),
+          Math.round(s0.b + f*(s1.b-s0.b))
+        ];
+      }}
+    }}
+    var l = stops[stops.length-1]; return [l.r, l.g, l.b];
+  }}
+
+  // ── Offscreen canvas: one pixel per IDW grid cell ────────────────────────
+  var n   = meta.grid_n;
+  var raw = document.createElement('canvas');
+  raw.width  = n;
+  raw.height = n;
+  var ctx = raw.getContext('2d');
+  var img = ctx.createImageData(n, n);
+  var alpha = Math.round({opacity_float} * 255);
+
+  for (var k = 0; k < grid.length; k++) {{
+    var pt  = grid[k];
+    var col = Math.round((pt[1] - meta.lon_min) / meta.lon_step);
+    var row = Math.round((pt[0] - meta.lat_min) / meta.lat_step);
+    // Canvas Y=0 is at the top (north), so invert the row
+    var py  = (n - 1) - row;
+    var px  = col;
+    if (px < 0 || px >= n || py < 0 || py >= n) continue;
+    var idx = (py * n + px) * 4;
+    var rgb = valToRGB(pt[2]);
+    img.data[idx]     = rgb[0];
+    img.data[idx + 1] = rgb[1];
+    img.data[idx + 2] = rgb[2];
+    img.data[idx + 3] = alpha;
+  }}
+  ctx.putImageData(img, 0, 0);
+
+  // ── Upscale with bilinear smoothing to reduce pixelation ────────────────
+  // Target ~480px on the shorter side; derived from grid_n so it adapts
+  // automatically as grid density scales with station count.
+  var overlayScale = Math.max(1, Math.ceil(480 / n));
+  var big    = document.createElement('canvas');
+  big.width  = n * overlayScale;
+  big.height = n * overlayScale;
+  var bigCtx = big.getContext('2d');
+  bigCtx.imageSmoothingEnabled = true;
+  bigCtx.imageSmoothingQuality = 'high';
+  bigCtx.drawImage(raw, 0, 0, big.width, big.height);
+
+  var dataURL = big.toDataURL('image/png');
+  var bounds  = [[meta.lat_min, meta.lon_min], [meta.lat_max, meta.lon_max]];
+  heatLayer   = L.imageOverlay(dataURL, bounds, {{ opacity: {opacity_float}, interactive: false }});
+  heatLayer.addTo(map);
+  console.log("[Heatmap] imageOverlay created. size:", size.x, "x", size.y,
+              "canvas:", big.width, "x", big.height, "heatMax:", heatMax);
+}}
+// initHeatOverlay() is called from Python via runJavaScript after
+// loadFinished fires — Python drives timing, not a JS self-timer.
 
 // ── Sensor marker layer ───────────────────────────────────────────────────
 sensors.forEach(function(s) {{
@@ -805,6 +1688,210 @@ sensors.forEach(function(s) {{
   }});
 }})();
 
+// ── Solar layer rendering ─────────────────────────────────────────────────
+function initSolarLayer() {{
+  // Use Python-computed IDW grid instead of point-based interpolation
+  var grid = PAYLOAD.solar_idw_grid;
+  var meta = PAYLOAD.solar_idw_meta;
+  if (!grid || !grid.length || !meta) return;
+  
+  // Use percentile-based scaling (p5-p95)
+  var solar_p5 = PAYLOAD.solar_p5;
+  var solar_p95 = PAYLOAD.solar_p95;
+  if (solar_p5 === null || solar_p95 === null || solar_p5 === solar_p95) return;
+  
+  var scale_range = solar_p95 - solar_p5;
+  
+  // Yellow to orange gradient stops
+  var stops = [
+    {{ t:0.0,  r:255, g:255, b:0   }},
+    {{ t:0.5,  r:255, g:200, b:0   }},
+    {{ t:1.0,  r:255, g:100, b:0   }}
+  ];
+  
+  function valToRGB(val) {{
+    // Normalize using percentile bounds
+    var t = Math.max(0, Math.min(1, (val - solar_p5) / scale_range));
+    for (var i = 1; i < stops.length; i++) {{
+      if (t <= stops[i].t) {{
+        var s0 = stops[i-1], s1 = stops[i];
+        var f = (t - s0.t) / (s1.t - s0.t);
+        return [
+          Math.round(s0.r + f*(s1.r-s0.r)),
+          Math.round(s0.g + f*(s1.g-s0.g)),
+          Math.round(s0.b + f*(s1.b-s0.b))
+        ];
+      }}
+    }}
+    var l = stops[stops.length-1]; return [l.r, l.g, l.b];
+  }}
+  
+  // Render grid directly (same approach as PM2.5 heatmap)
+  var n = meta.grid_n;
+  var raw = document.createElement('canvas');
+  raw.width = n;
+  raw.height = n;
+  var ctx = raw.getContext('2d');
+  var img = ctx.createImageData(n, n);
+  var alpha = Math.round(0.7 * 255);
+  
+  for (var k = 0; k < grid.length; k++) {{
+    var pt = grid[k];
+    var col = Math.round((pt[1] - meta.lon_min) / meta.lon_step);
+    var row = Math.round((pt[0] - meta.lat_min) / meta.lat_step);
+    var py = (n - 1) - row;  // Canvas Y = 0 at north
+    var px = col;
+    if (px < 0 || px >= n || py < 0 || py >= n) continue;
+    var idx = (py * n + px) * 4;
+    var rgb = valToRGB(pt[2]);
+    img.data[idx] = rgb[0];
+    img.data[idx + 1] = rgb[1];
+    img.data[idx + 2] = rgb[2];
+    img.data[idx + 3] = alpha;
+  }}
+  ctx.putImageData(img, 0, 0);
+  
+  // Upscale with high-quality smoothing
+  var overlayScale = Math.max(1, Math.ceil(480 / n));
+  var big = document.createElement('canvas');
+  big.width = n * overlayScale;
+  big.height = n * overlayScale;
+  var bigCtx = big.getContext('2d');
+  bigCtx.imageSmoothingEnabled = true;
+  bigCtx.imageSmoothingQuality = 'high';
+  bigCtx.drawImage(raw, 0, 0, big.width, big.height);
+  
+  var dataURL = big.toDataURL('image/png');
+  var bounds = [[meta.lat_min, meta.lon_min], [meta.lat_max, meta.lon_max]];
+  solarHeatLayer = L.imageOverlay(dataURL, bounds, {{ opacity: 0.7, interactive: false }});
+  if (layerState.solar) solarHeatLayer.addTo(map);
+}}
+
+// ── Storm layer rendering ─────────────────────────────────────────────────
+function initStormLayer() {{
+  // Only render if storm layer is active (thresholds met)
+  if (!PAYLOAD.storm_layer_active) {{
+    console.log("[Storm Layer] Thresholds not met, skipping storm layer rendering");
+    return;  // Don't render storm colors
+  }}
+  
+  // Use Python-computed IDW grid instead of JS interpolation
+  var grid = PAYLOAD.storm_idw_grid;
+  var meta = PAYLOAD.storm_idw_meta;
+  if (!grid || !grid.length || !meta) return;
+  
+  // Use percentile-based scaling (p5-p95)
+  var storm_p5 = PAYLOAD.storm_p5;
+  var storm_p95 = PAYLOAD.storm_p95;
+  if (storm_p5 === null || storm_p95 === null || storm_p5 === storm_p95) return;
+  
+  var scale_range = storm_p95 - storm_p5;
+  
+  // Purple to red gradient stops
+  var stops = [
+    {{ t:0.0,  r:150, g:0,   b:255 }},
+    {{ t:0.5,  r:200, g:0,   b:150 }},
+    {{ t:1.0,  r:255, g:0,   b:0   }}
+  ];
+  
+  function valToRGB(val) {{
+    // Normalize using percentile bounds
+    var t = Math.max(0, Math.min(1, (val - storm_p5) / scale_range));
+    for (var i = 1; i < stops.length; i++) {{
+      if (t <= stops[i].t) {{
+        var s0 = stops[i-1], s1 = stops[i];
+        var f = (t - s0.t) / (s1.t - s0.t);
+        return [
+          Math.round(s0.r + f*(s1.r-s0.r)),
+          Math.round(s0.g + f*(s1.g-s0.g)),
+          Math.round(s0.b + f*(s1.b-s0.b))
+        ];
+      }}
+    }}
+    var l = stops[stops.length-1]; return [l.r, l.g, l.b];
+  }}
+  
+  // Render grid directly (same approach as PM2.5 heatmap)
+  var n = meta.grid_n;
+  var raw = document.createElement('canvas');
+  raw.width = n;
+  raw.height = n;
+  var ctx = raw.getContext('2d');
+  var img = ctx.createImageData(n, n);
+  var alpha = Math.round(0.7 * 255);
+  
+  for (var k = 0; k < grid.length; k++) {{
+    var pt = grid[k];
+    var col = Math.round((pt[1] - meta.lon_min) / meta.lon_step);
+    var row = Math.round((pt[0] - meta.lat_min) / meta.lat_step);
+    var py = (n - 1) - row;  // Canvas Y = 0 at north
+    var px = col;
+    if (px < 0 || px >= n || py < 0 || py >= n) continue;
+    var idx = (py * n + px) * 4;
+    var rgb = valToRGB(pt[2]);
+    img.data[idx] = rgb[0];
+    img.data[idx + 1] = rgb[1];
+    img.data[idx + 2] = rgb[2];
+    img.data[idx + 3] = alpha;
+  }}
+  ctx.putImageData(img, 0, 0);
+  
+  // Upscale with high-quality smoothing
+  var overlayScale = Math.max(1, Math.ceil(480 / n));
+  var big = document.createElement('canvas');
+  big.width = n * overlayScale;
+  big.height = n * overlayScale;
+  var bigCtx = big.getContext('2d');
+  bigCtx.imageSmoothingEnabled = true;
+  bigCtx.imageSmoothingQuality = 'high';
+  bigCtx.drawImage(raw, 0, 0, big.width, big.height);
+  
+  var dataURL = big.toDataURL('image/png');
+  var bounds = [[meta.lat_min, meta.lon_min], [meta.lat_max, meta.lon_max]];
+  stormHeatLayer = L.imageOverlay(dataURL, bounds, {{ opacity: 0.7, interactive: false }});
+  if (layerState.storm) stormHeatLayer.addTo(map);
+}}
+
+// ── Lightning markers (using canvas for performance) ──────────────────────
+lightningLayer.forEach(function(strike) {{
+  var lat = strike.lat, lon = strike.lon;
+  if (lat == null || lon == null) return;
+  
+  // Use canvas marker (L.circleMarker) for better performance
+  // If PNG data URL is available, use it; otherwise use simple circle
+  var marker;
+  if (`{lightning_icon_data_url}` && `{lightning_icon_data_url}`.length > 0) {{
+    // Use PNG icon if available
+    var icon = L.icon({{
+      iconUrl: `{lightning_icon_data_url}`,
+      iconSize: [24, 24],
+      iconAnchor: [12, 12]
+    }});
+    marker = L.marker([lat, lon], {{ icon: icon }}).addTo(lightningGroup);
+  }} else {{
+    // Fallback to canvas circle marker (faster than SVG)
+    marker = L.circleMarker([lat, lon], {{
+      radius: 8,
+      fillColor: '#FFD700',
+      color: '#000',
+      weight: 1,
+      opacity: 1,
+      fillOpacity: 0.8
+    }}).addTo(lightningGroup);
+  }}
+  
+  var popup = 'Blixtnedslag<br>';
+  if (strike.timestamp) popup += 'Tid: ' + strike.timestamp + '<br>';
+  if (strike.intensity != null) popup += 'Intensitet: ' + strike.intensity.toFixed(1) + '<br>';
+  marker.bindPopup(popup);
+}});
+
+// Initialize solar and storm layers after map is ready
+setTimeout(function() {{
+  initSolarLayer();
+  initStormLayer();
+}}, 1000);
+
 // ── Layer toggle logic ────────────────────────────────────────────────────
 function toggleLayer(name) {{
   layerState[name] = !layerState[name];
@@ -814,11 +1901,17 @@ function toggleLayer(name) {{
     if (name === 'markers') map.addLayer(markerGroup);
     if (name === 'sensors') map.addLayer(sensorGroup);
     if (name === 'heatmap' && heatLayer) map.addLayer(heatLayer);
+    if (name === 'solar' && solarHeatLayer) map.addLayer(solarHeatLayer);
+    if (name === 'storm' && stormHeatLayer) map.addLayer(stormHeatLayer);
+    if (name === 'lightning') map.addLayer(lightningGroup);
   }} else {{
     btn.classList.remove('active');
     if (name === 'markers') map.removeLayer(markerGroup);
     if (name === 'sensors') map.removeLayer(sensorGroup);
     if (name === 'heatmap' && heatLayer) map.removeLayer(heatLayer);
+    if (name === 'solar' && solarHeatLayer) map.removeLayer(solarHeatLayer);
+    if (name === 'storm' && stormHeatLayer) map.removeLayer(stormHeatLayer);
+    if (name === 'lightning') map.removeLayer(lightningGroup);
   }}
 }}
 

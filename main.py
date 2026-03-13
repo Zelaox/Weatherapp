@@ -8,14 +8,14 @@ from pathlib import Path
 log_dir = Path("logs")
 log_dir.mkdir(exist_ok=True)
 
-# Set environment variable to disable pyqtgraph if it causes issues
-os.environ.setdefault('PYQTGRAPH_QT_LIB', 'PyQt5')
+# Use non-interactive Agg backend globally (no Qt integration)
+import matplotlib
+matplotlib.use("Agg")
 
 from PyQt5.QtWidgets import QApplication
 from PyQt5.QtCore import QTimer
 import asyncio
 from controllers.weather_controller import WeatherController
-from controllers.update_scheduler import UpdateScheduler
 from gui.main_window import MainWindow
 from utils.logger import WeatherLogger
 
@@ -51,6 +51,10 @@ def main():
     logger.info("Startar väderapplikation")
     logger.info("=" * 60)
     
+    # Log matplotlib backend
+    import matplotlib
+    logger.info(f"Matplotlib backend: {matplotlib.get_backend()}")
+    
     try:
         # Create application
         logger.info("Skapar QApplication...")
@@ -76,36 +80,62 @@ def main():
         logger.info("Initialiserar controller...")
         controller = WeatherController()
         logger.info("Controller initialiserad")
-        
-        # Initialize scheduler
-        logger.info("Initialiserar scheduler...")
-        scheduler = UpdateScheduler(controller)
-        logger.info("Scheduler initialiserad")
-        
+
         # Create main window
         logger.info("Skapar huvudfönster...")
         window = MainWindow(controller)
         logger.info("Huvudfönster skapat")
         
         # Note: UI refresh is now event-driven via controller.data_updated signal
-        # The scheduler's update_triggered signal is not connected to refresh
-        # because we only want to refresh when data is actually saved, not when update starts
         logger.info("UI refresh är event-driven (endast vid faktisk datainsättning)")
-        
-        # Add scheduler methods to controller for GUI access
-        controller.start_auto_update = scheduler.start
-        controller.stop_auto_update = scheduler.stop
 
-        # pause_auto_update: halts the timer without clearing the "enabled" toolbar state.
-        # Identical to stop; named separately so call-sites are semantically clear.
-        controller.pause_auto_update = scheduler.stop
+        # Auto-update: QTimer-based periodic update (interval from config)
+        _auto_update_timer = [None]  # use list so closure can rebind
 
-        def _restart_auto_update(minutes: int):
-            """Set a new interval then restart the scheduler."""
-            scheduler.set_interval(minutes)
-            scheduler.start()
+        def _get_auto_update_interval_ms():
+            try:
+                minutes = controller.config.get_setting("auto_update_interval_minutes", 10)
+                return max(1, int(minutes)) * 60 * 1000
+            except Exception:
+                return 10 * 60 * 1000
 
-        controller.restart_auto_update = _restart_auto_update
+        def _on_auto_update_tick():
+            try:
+                controller.update_all_cities()
+            except Exception as e:
+                logger.error(f"Fel vid auto-uppdatering: {e}")
+
+        def start_auto_update():
+            if _auto_update_timer[0] is not None:
+                return
+            t = QTimer()
+            t.timeout.connect(_on_auto_update_tick)
+            t.start(_get_auto_update_interval_ms())
+            _auto_update_timer[0] = t
+            logger.info("Auto-uppdatering startad")
+
+        def stop_auto_update():
+            if _auto_update_timer[0] is not None:
+                _auto_update_timer[0].stop()
+                _auto_update_timer[0] = None
+                logger.info("Auto-uppdatering stoppad")
+
+        def pause_auto_update():
+            stop_auto_update()
+
+        def restart_auto_update(minutes):
+            stop_auto_update()
+            t = QTimer()
+            t.timeout.connect(_on_auto_update_tick)
+            t.start(max(1, int(minutes)) * 60 * 1000)
+            _auto_update_timer[0] = t
+            logger.info(f"Auto-uppdatering omstartad med intervall {minutes} min")
+
+        controller.start_auto_update = start_auto_update
+        controller.stop_auto_update = stop_auto_update
+        controller.pause_auto_update = pause_auto_update
+        controller.restart_auto_update = restart_auto_update
+
         def safe_manual_update():
             """Safely trigger manual update."""
             try:
@@ -116,14 +146,8 @@ def main():
                 logger.error(f"Fel vid manuell uppdatering: {e}")
         
         controller.manual_update = safe_manual_update
-        logger.info("Scheduler-metoder kopplade till controller")
-        
-        # Auto-update: Start by default to ensure data updates
-        # User can disable it via toolbar button if desired
-        scheduler.start()
-        logger.info("Auto-uppdatering startad som standard (intervall: 10 minuter)")
-        
-        # Initialize new sensor engine system (optional, can be enabled separately)
+
+        # No auto-update; use manual update when needed
         sensor_engine = None
         if HAS_QASYNC:
             try:
@@ -229,6 +253,12 @@ def main():
                 logger.info("Huvudfönster visas (utan qasync)")
                 exit_code = app.exec_()
         finally:
+            # Stop auto-update timer if running
+            if hasattr(controller, 'stop_auto_update'):
+                try:
+                    controller.stop_auto_update()
+                except Exception:
+                    pass
             # Cleanup sensor engine if it was initialized
             if sensor_engine:
                 try:

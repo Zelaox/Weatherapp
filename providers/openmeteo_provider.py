@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 from typing import Dict, Optional, Any, List
 from providers.base_provider import WeatherProvider
 from utils.logger import WeatherLogger
+from utils.unit_conversion import convert_parameter_unit
 
 # CET timezone for all operations
 CET = ZoneInfo("Europe/Stockholm")
@@ -477,23 +478,17 @@ class OpenMeteoProvider(WeatherProvider):
             # Use measurement timestamp if available, otherwise use collector timestamp
             timestamp = measurement_timestamp if measurement_timestamp else datetime.now(CET)
             
-            # Basic weather
+            # Basic weather (raw from API)
             temperature = current.get("temperature_2m")
             humidity_val = current.get("relative_humidity_2m")
-            wind_speed_val = current.get("wind_speed_10m")
+            wind_speed_raw = current.get("wind_speed_10m")
             
-            # Log raw wind_speed_10m value from API for debugging
+            # Log raw wind_speed_10m value from API for debugging (API doc: km/h by default)
             if self.logger:
-                if wind_speed_val is not None:
+                if wind_speed_raw is not None:
                     self.logger.debug(
-                        f"Open-Meteo: Råa wind_speed_10m från API för ({latitude:.4f}, {longitude:.4f}): {wind_speed_val} m/s"
+                        f"Open-Meteo: Råa wind_speed_10m från API för ({latitude:.4f}, {longitude:.4f}): {wind_speed_raw}"
                     )
-                    # Log warning if value is unusually high (>20 m/s)
-                    if float(wind_speed_val) > 20.0:
-                        self.logger.warning(
-                            f"Open-Meteo: Ovanligt högt wind_speed_10m-värde från API: {wind_speed_val} m/s "
-                            f"för ({latitude:.4f}, {longitude:.4f})"
-                        )
                 else:
                     self.logger.debug(
                         f"Open-Meteo: wind_speed_10m är None från API för ({latitude:.4f}, {longitude:.4f})"
@@ -522,14 +517,40 @@ class OpenMeteoProvider(WeatherProvider):
 
             # Storm parameters (from hourly request, already extracted above)
             # cape, precip_prob, conv_precip are set from hourly request
-
-            # Convert wind_speed_val to float and log the converted value
-            wind_speed_converted = float(wind_speed_val) if wind_speed_val is not None else None
+            
+            # Convert wind_speed to databasenhet via central unit converter
+            wind_speed_converted = None
+            if wind_speed_raw is not None:
+                try:
+                    if self.db_manager is not None:
+                        wind_speed_converted = convert_parameter_unit(
+                            self.db_manager,
+                            "wind_speed",
+                            float(wind_speed_raw),
+                            self.name,
+                            logger=self.logger,
+                        )
+                    else:
+                        # No DB available for units: assume raw value is already in target unit
+                        wind_speed_converted = float(wind_speed_raw)
+                except Exception as e:
+                    if self.logger:
+                        self.logger.warning(
+                            f"Open-Meteo: Kunde inte konvertera wind_speed-värde {wind_speed_raw} "
+                            f"för ({latitude:.4f}, {longitude:.4f}): {e}"
+                        )
+                    wind_speed_converted = None
+            
             if self.logger and wind_speed_converted is not None:
                 self.logger.debug(
-                    f"Open-Meteo: Konverterat wind_speed-värde för ({latitude:.4f}, {longitude:.4f}): "
-                    f"{wind_speed_converted:.2f} m/s (från wind_speed_10m={wind_speed_val})"
+                    f"[UNITS] Open-Meteo: wind_speed_10m raw={wind_speed_raw} "
+                    f"-> stored wind_speed={wind_speed_converted:.2f} (provider={self.name})"
                 )
+                if float(wind_speed_converted) > 20.0:
+                    self.logger.warning(
+                        f"Open-Meteo: Högt wind_speed-värde efter konvertering: {wind_speed_converted:.2f} m/s "
+                        f"för ({latitude:.4f}, {longitude:.4f}) – verifiera enheter och data."
+                    )
             
             result = {
                 "temperature": float(temperature) if temperature is not None else None,

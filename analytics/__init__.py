@@ -1,21 +1,10 @@
 """Analytics module for weather data analysis."""
 
-from analytics.graph_generator import GraphGenerator
-from analytics.graph_modes import (
-    BaseMode,
-    DailyMode,
-    WeeklyMode,
-    MonthlyMode,
-    YearlyMode,
-    MODES
-)
+# Direct imports for analytics modules
+from analytics.chart_colors import ChartStyleMapper
+from analytics.derived_metrics import DerivedMetricsCalculator
 
 __all__ = [
-    'GraphGenerator',
-    'BaseMode',
-    'DailyMode',
-    'WeeklyMode',
-    'MonthlyMode',
-    'YearlyMode',
-    'MODES'
+    'ChartStyleMapper',
+    'DerivedMetricsCalculator',
 ]

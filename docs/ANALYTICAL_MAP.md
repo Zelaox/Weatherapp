@@ -67,9 +67,12 @@ The Stations tab renders an analytical Leaflet map that goes beyond simple marke
 │                                                              │
 │  Leaflet markers (AQI colour + wind ring)                    │
 │  Leaflet.heat heatmap (density-aware)                        │
-│  Analytical popups (sparkline SVG + inversion gauge)         │
+│  Solar layer (heatmap from analytical_indices.solar_index)  │
+│  Storm layer (heatmap from analytical_indices.storm_risk)   │
+│  Lightning layer (markers from lightning_events)            │
+│  Analytical popups (sparkline + inversion gauge)         │
 │  Cluster alert banner                                        │
-│  Layer toggle toolbar                                        │
+│  Layer toggle toolbar (Stationer, Heatmap, Sol, Åska, Blixtar, Sensorer) │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -85,10 +88,14 @@ weather.db
   ├── get_weather_history(hours=24)        → per-city trend points
   ├── get_national_pm25_7day_average()     → national 7-day PM2.5 baseline
   ├── get_parameter_winsorized_bounds()    → p5/p95 from full history
-  └── get_all_sensors()                   → raw sensor marker layer
+  ├── get_all_sensors()                   → raw sensor marker layer
+  ├── get_latest_analytical_indices()     → solar_index, storm_risk, smog_risk
+  └── lightning_events table              → strike events for lightning layer
            │
            ▼
     MapDataBuilder.build()
+           │
+           ▼  adds: solar_layer, storm_layer, lightning_layer
            │
            ▼  single JSON object
     _generate_map_html()
@@ -149,7 +156,14 @@ Builds the complete payload consumed by Leaflet. Instantiated fresh on every map
         "percentile_range": [int, int],        # always [5, 95]
         "data_rows_used":   int,
         "bounds_available": bool,
-    }
+    },
+    "idw_grid":       [[lat, lon, value], ...],  # IDW interpolation grid for PM2.5 heatmap
+    "idw_meta":       {...},                     # grid geometry metadata
+    "idw_max":        float,                     # p95 colour-scale anchor
+    "idw_true_max":   float,                     # actual grid maximum
+    "solar_layer":    [{"lat": float, "lon": float, "solar_index": float}, ...],  # Solar index heatmap points
+    "storm_layer":    [{"lat": float, "lon": float, "storm_risk": float}, ...],   # Storm risk heatmap points
+    "lightning_layer": [{"lat": float, "lon": float, "timestamp": str, "intensity": float}, ...],  # Lightning strike markers
 }
 ```
 
@@ -385,14 +399,36 @@ The JavaScript in `_generate_map_html()` is a pure renderer. It receives `PAYLOA
 
 ```javascript
 setTimeout(function() {
+    if (typeof L.heatLayer !== "function") {
+        console.error("[Heatmap] leaflet.heat not loaded — heatLayer skipped");
+        return;
+    }
     map.invalidateSize();   // force Qt layout recalculation
     if (heatPoints.length > 0) {
-        heatLayer = L.heatLayer(...).addTo(map);
+        heatLayer = L.heatLayer(heatPoints, { max: heatMax, ... }).addTo(map);
     }
-}, 300);
+}, 800);
 ```
 
-`map.invalidateSize()` forces Leaflet to re-query the container dimensions from the Qt layout engine before `leaflet.heat` touches the canvas. The 300 ms delay is the safe margin for Qt's layout pass to complete.
+`map.invalidateSize()` forces Leaflet to re-query the container dimensions from the Qt layout engine before `leaflet.heat` touches the canvas. The 800 ms delay is the safe margin for Qt's layout pass to complete. 300 ms was insufficient on slower systems.
+
+### Heatmap `max` is data-driven
+
+`leaflet.heat` normalizes each point's intensity as `value / max`. A hardcoded `max` (e.g. 150 µg/m³) makes the heatmap invisible when ambient PM2.5 values are low (typical Swedish clean-air readings of 1–10 µg/m³ would render at < 7% intensity).
+
+`heatMax` is computed dynamically before the `setTimeout`:
+
+```javascript
+var heatMax = heatPoints.length > 0
+    ? Math.max.apply(null, heatPoints.map(function(p) { return p[2]; }))
+    : 1.0;
+```
+
+The full gradient always maps to the actual observed data range. No physics constant or threshold is introduced.
+
+### leaflet-heat bundled locally
+
+`leaflet-heat.js` is served as an inline `<script>` block — the file content is read from `ui/static/leaflet-heat.js` at HTML generation time. No CDN request is made at runtime. QWebEngine frequently blocks external CDN requests silently; inlining eliminates that failure mode entirely.
 
 ### Popup components
 
@@ -400,7 +436,7 @@ Each city marker opens a popup containing:
 
 1. **City name + AQI badge** — colour from `aqi_color`, label from `aqi_level_name`
 2. **Current values** — PM2.5 (24h), temperature, humidity, wind speed, NO₂, O₃
-3. **24h PM2.5 sparkline** — inline SVG path, no external charting library
+3. **24h PM2.5 sparkline** — inline path, no external charting library
 4. **Inversion risk gauge** — horizontal bar (0–100), colour-coded:
    - Green: score < 40
    - Orange: 40–69
@@ -419,18 +455,117 @@ Rendered at the bottom of the map from the `cluster_alerts` array. Only visible 
 
 ---
 
-## Configuration Constants
+## Calibration Parameters (DB-driven)
 
-The following four named constants are the **complete and exhaustive set** of non-derived constants in the analytical map system. They are configuration values (sensitivity/tolerance parameters), not physical thresholds.
+All analytical model parameters are stored in the `calibration_parameters` table and read from the database at runtime. No hardcoded constants remain in the codebase.
 
-| Constant | Value | Role |
-|---|---|---|
-| `INVERSION_P_LOW` | `5` | Lower winsorization percentile — outlier cutoff |
-| `INVERSION_P_HIGH` | `95` | Upper winsorization percentile — outlier cutoff |
-| `INVERSION_WIND_WEIGHT` | `0.6` | Wind speed contribution to inversion score |
-| `INVERSION_HUMIDITY_WEIGHT` | `0.4` | Humidity contribution to inversion score |
+### Inversion Model Parameters
 
-`INVERSION_WIND_WEIGHT + INVERSION_HUMIDITY_WEIGHT` = `1.0` always.
+| Key | Default Value | Unit | Role |
+|---|---|---|---|
+| `inversion_p_low` | `5.0` | percentile | Lower winsorization percentile — outlier cutoff |
+| `inversion_p_high` | `95.0` | percentile | Upper winsorization percentile — outlier cutoff |
+| `inversion_wind_weight` | `0.6` | dimensionless | Wind speed contribution to inversion score (0.0-1.0) |
+| `inversion_humidity_weight` | `0.4` | dimensionless | Humidity contribution to inversion score (0.0-1.0) |
+
+**Invariant:** `inversion_wind_weight + inversion_humidity_weight` = `1.0` always (enforced by normalization if needed).
+
+### IDW Heatmap Parameters
+
+| Key | Default Value | Unit | Role |
+|---|---|---|---|
+| `idw_power` | `2.3` | dimensionless | IDW decay exponent — higher values create tighter local hotspots |
+| `idw_max_r_factor` | `1.3` | dimensionless | Factor dividing max_r to prevent distant stations from dominating interpolation |
+| `idw_scale_percentile` | `95.0` | percentile | Colour scale anchor percentile for IDW heatmap (outlier-robust) |
+
+### Map Extent (heatmap and view bounds)
+
+The geographic extent of the map and of all heatmap layers (PM2.5, solar, storm) is **DB-driven**; no coordinates are hardcoded in application code.
+
+| Key | Role |
+|-----|------|
+| `map_extent_lat_min`, `map_extent_lat_max` | Southern and northern latitude bounds |
+| `map_extent_lon_min`, `map_extent_lon_max` | Western and eastern longitude bounds |
+
+- **Source**: Read from `calibration_parameters` at runtime (migration sets a default Sweden bbox, e.g. lat 55.3–69.1, lon 11–24.2). Values can be changed in the DB for other regions.
+- **Fallback**: If any of the four keys is missing or invalid, the extent is computed from the **bounding box of all cities** in the `cities` table (with 5% padding). Thus the map and heatmap always cover either the configured region or the full set of stations.
+- **Usage**: `MapDataBuilder._get_map_extent()` returns `(lat_min, lat_max, lon_min, lon_max)`. This extent is passed to `_compute_idw_grid` and `_compute_layer_idw_grid` so all heatmap layers share the same geographic box. The payload includes `map_extent`; the Leaflet map uses `fitBounds()` so the full extent is visible on load.
+
+### Solar, Storm, and Lightning Layers
+
+The map supports multiple analytical layers that can be toggled independently:
+
+**Solar Layer:**
+- Data source: `analytical_indices.solar_index` (latest per city)
+- Rendering: Canvas-based heatmap (similar to PM2.5 heatmap)
+- Color gradient: Yellow to orange (represents solar intensity)
+- Opacity: Configurable via `solar_layer_opacity` in `calibration_parameters` (default: 70%)
+
+**Storm Layer:**
+- Data source: `analytical_indices.storm_risk` (latest per city)
+- Rendering: Canvas-based heatmap
+- Color gradient: Purple to red (represents storm risk intensity)
+- Opacity: Configurable via `storm_layer_opacity` in `calibration_parameters` (default: 70%)
+
+**Lightning Layer:**
+- Data source: `lightning_events` table (last 24h, configurable via `lightning_display_hours`)
+- Rendering: Custom markers with lightning bolt (⚡)
+- Popup: Shows timestamp, intensity, distance from city center
+- Opacity: Configurable via `lightning_layer_opacity` in `calibration_parameters` (default: 100%)
+
+**Layer Toggle Buttons:**
+- Dynamically generated in map toolbar
+- Buttons: "Stationer", "Heatmap", "Sol", "Åska", "Blixtar", "Sensorer"
+- Each layer can be toggled independently
+- Layer state persists during map session
+
+### Analytical Indices
+
+Analytical indices are computed after weather data is saved:
+
+**Solar Index:**
+- Formula: `w1*normalize(solar_radiation) + w2*normalize(uv_index) + w3*normalize(sunshine_duration)`
+- Weights: `solar_index_radiation_weight`, `solar_index_uv_weight`, `solar_index_sunshine_weight` (from `calibration_parameters`)
+- Range: [0, 1]
+
+**Storm Risk:**
+- Formula: `storm_risk = base_risk × cape_factor` where `cape_factor = _calculate_cape_factor(cape)`
+- Base risk: `w1*normalize(convective_precipitation) + w2*normalize(precipitation_probability) + w3*normalize(humidity) - w4*normalize(wind_speed)`
+- CAPE scaling: Piecewise linear scaling with meteorologically significant thresholds (0, 100, 1000, 2500 J/kg)
+- Parameters: `storm_risk_cape_zero_threshold`, `storm_risk_cape_weak_threshold`, `storm_risk_cape_moderate_threshold`, `storm_risk_cape_strong_threshold`, `storm_risk_cape_weak_factor`, `storm_risk_cape_moderate_factor`, `storm_risk_cape_strong_factor`, `storm_risk_cape_extreme_factor`, `storm_risk_convective_weight`, etc. (from `calibration_parameters`)
+- Range: [0, 1] (CAPE = 0 → storm_risk = 0, absolute gate - meteorologically correct)
+
+**Smog Risk:**
+- Formula: `w1*normalize(o3) + w2*normalize(solar_radiation) - w3*normalize(wind_speed)`
+- Weights: `smog_risk_o3_weight`, `smog_risk_solar_weight`, `smog_risk_wind_weight` (from `calibration_parameters`)
+- Range: [0, 1]
+
+All indices are stored in `analytical_indices` table with timestamp for historical analysis.
+
+### Time Windows
+
+| Key | Default Value | Unit | Role |
+|---|---|---|---|
+| `time_window_trend_hours` | `24.0` | hours | Hours of history for trend sparklines and per-city statistics |
+| `time_window_baseline_days` | `7.0` | days | Days for national baseline in cluster analysis |
+| `time_window_rolling_avg_hours` | `24.0` | hours | Hours for rolling average calculations (PM2.5, etc.) |
+
+### Wind Aggregation
+
+| Key | Default Value | Unit | Role |
+|---|---|---|---|
+| `wind_aggregation_method` | `1.0` | code | Aggregation method: 0=mean, 1=median, 2=winsorized_mean (default: 1=median) |
+| `wind_winsorize_p_low` | `5.0` | percentile | Lower percentile for winsorized mean (only used if method=2) |
+| `wind_winsorize_p_high` | `95.0` | percentile | Upper percentile for winsorized mean (only used if method=2) |
+
+**Wind aggregation methods:**
+- **Mean (0)**: Arithmetic average — sensitive to outliers (e.g., a single 50 m/s station can skew the national average).
+- **Median (1, default)**: Middle value — robust to outliers, recommended for national aggregates.
+- **Winsorized mean (2)**: Mean after clamping extreme values to p5/p95 percentiles — balances robustness with sensitivity to distribution shape.
+
+### Accessing Calibration Parameters
+
+Parameters are accessed via `DatabaseManager.get_calibration_parameter(key)` or `get_all_calibration_parameters()`. If a required parameter is missing from the database, the system fails loudly with a clear error message — no silent fallbacks to code constants.
 
 All other values used in computations are either:
 - Fetched from `weather_data` (bounds, means, counts)

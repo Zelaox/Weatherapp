@@ -6,4 +6,3 @@ python-dotenv>=1.0.0
 PyQtWebEngine>=5.15.0 # Required for interactive map in Stations tab
 qasync>=0.27.0 # Required for Qt + asyncio integration in sensor engine
 aiohttp>=3.8.0 # Required for async HTTP in sensor providers
-# pyqtgraph>=0.13.0  # Optional - causes crashes on some Windows systems

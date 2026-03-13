@@ -3,6 +3,7 @@
 from PyQt5.QtWidgets import QWidget, QVBoxLayout, QLabel, QFrame
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QFont, QColor, QPalette
+from typing import Dict
 
 
 class WeatherPanel(QWidget):
@@ -51,29 +52,20 @@ class WeatherPanel(QWidget):
         self.details_label.setAlignment(Qt.AlignCenter)
         layout.addWidget(self.details_label)
         
-        # Air quality section (raw pollutants only)
+        # Air quality section (raw pollutants only - dynamically displayed)
         self.aq_group = QFrame()
         self.aq_group.setFrameShape(QFrame.Box)
         self.aq_group.setMinimumHeight(100)
         aq_layout = QVBoxLayout(self.aq_group)
         aq_layout.setSpacing(8)
         
-        # PM2.5 (primary)
-        self.pm25_label = QLabel("PM2.5: -- µg/m³")
-        pm25_font = QFont()
-        pm25_font.setPointSize(16)
-        pm25_font.setBold(True)
-        self.pm25_label.setFont(pm25_font)
-        self.pm25_label.setAlignment(Qt.AlignCenter)
-        aq_layout.addWidget(self.pm25_label)
-        
-        # Additional pollutants (if available)
-        self.other_pollutants_label = QLabel("")
-        other_font = QFont()
-        other_font.setPointSize(10)
-        self.other_pollutants_label.setFont(other_font)
-        self.other_pollutants_label.setAlignment(Qt.AlignCenter)
-        aq_layout.addWidget(self.other_pollutants_label)
+        # Dynamic pollutants label (will show all available pollutants)
+        self.pollutants_label = QLabel("")
+        pollutants_font = QFont()
+        pollutants_font.setPointSize(12)
+        self.pollutants_label.setFont(pollutants_font)
+        self.pollutants_label.setAlignment(Qt.AlignCenter)
+        aq_layout.addWidget(self.pollutants_label)
         
         layout.addWidget(self.aq_group)
         
@@ -88,9 +80,70 @@ class WeatherPanel(QWidget):
         
         layout.addStretch()
     
+    def _get_pollutant_metadata(self) -> Dict[str, Dict[str, str]]:
+        """
+        Get pollutant metadata (display names and units) from parameter_registry.
+        Returns dict mapping parameter_name -> {display_name, unit}.
+        """
+        metadata = {}
+        try:
+            db = self.controller.db
+            conn = db.get_connection()
+            cursor = conn.cursor()
+            
+            # Query parameter_registry for air_quality category parameters
+            cursor.execute("""
+                SELECT parameter_name, display_name, unit
+                FROM parameter_registry
+                WHERE category = 'air_quality'
+            """)
+            
+            for row in cursor.fetchall():
+                metadata[row['parameter_name']] = {
+                    'display_name': row['display_name'],
+                    'unit': row['unit']
+                }
+        except Exception as e:
+            # If parameter_registry doesn't exist or query fails, use fallback formatting
+            # But we should still try to display pollutants dynamically
+            import logging
+            logger = logging.getLogger("WeatherApp.gui.weather_panel")
+            logger.warning(f"Could not load parameter metadata from parameter_registry: {e}")
+        
+        return metadata
+    
+    def _format_pollutant_value(self, param_name: str, value: float, metadata: Dict[str, Dict[str, str]]) -> str:
+        """
+        Format a pollutant value with display name and unit.
+        
+        Args:
+            param_name: Parameter name (e.g., 'pm25', 'no2')
+            value: Numeric value
+            metadata: Dict from _get_pollutant_metadata()
+            
+        Returns:
+            Formatted string (e.g., "PM2.5: 12.3 µg/m³")
+        """
+        if param_name in metadata:
+            display_name = metadata[param_name]['display_name']
+            unit = metadata[param_name]['unit']
+        else:
+            # Fallback: format parameter name (e.g., 'pm25' -> 'PM25', 'no2' -> 'NO2')
+            display_name = param_name.upper().replace('_', ' ')
+            # Try to infer unit from common patterns
+            if 'pm' in param_name.lower():
+                unit = 'µg/m³'
+            elif param_name.lower() in ['no2', 'o3', 'so2', 'co']:
+                unit = 'µg/m³'
+            else:
+                unit = ''
+        
+        return f"{display_name}: {value:.1f} {unit}".strip()
+    
     def update_weather(self, city_name: str, weather_data: dict):
         """
         Update weather display.
+        Dynamically displays all pollutants from weather_data (no hardcoding, no fallbacks).
         
         Args:
             city_name: Name of the city
@@ -102,10 +155,6 @@ class WeatherPanel(QWidget):
             temp = weather_data.get('temperature')
             humidity = weather_data.get('humidity')
             wind_speed = weather_data.get('wind_speed')
-            pm25 = weather_data.get('pm25')
-            pm10 = weather_data.get('pm10')
-            no2 = weather_data.get('no2')
-            o3 = weather_data.get('o3')
             timestamp = weather_data.get('timestamp', '')
             
             # Temperature
@@ -119,28 +168,40 @@ class WeatherPanel(QWidget):
             if humidity is not None:
                 details.append(f"Luftfuktighet: {humidity:.0f}%")
             if wind_speed is not None:
-                details.append(f"Vind: {wind_speed:.1f} m/s")
+                details.append(f"Vind (medel): {wind_speed:.1f} m/s")
             self.details_label.setText(" | ".join(details) if details else "")
             
-            # PM2.5 (primary display)
-            if pm25 is not None:
-                self.pm25_label.setText(f"PM2.5: {pm25:.1f} µg/m³")
-            else:
-                self.pm25_label.setText("PM2.5: Ej tillgängligt")
+            # Pollutants: dynamically discover and display all pollutants from weather_data
+            # Exclude non-pollutant fields
+            excluded_fields = {
+                'temperature', 'humidity', 'wind_speed', 'timestamp', 
+                'source', 'aqi', 'measurement_timestamp', 'city_id',
+                'uv_index', 'solar_radiation', 'direct_radiation', 
+                'diffuse_radiation', 'sunshine_duration', 'cape',
+                'precipitation_probability', 'convective_precipitation'
+            }
             
-            # Other pollutants
-            other_pollutants = []
-            if pm10 is not None:
-                other_pollutants.append(f"PM10: {pm10:.1f} µg/m³")
-            if no2 is not None:
-                other_pollutants.append(f"NO₂: {no2:.1f} µg/m³")
-            if o3 is not None:
-                other_pollutants.append(f"O₃: {o3:.1f} µg/m³")
+            # Get pollutant metadata for display names and units
+            pollutant_metadata = self._get_pollutant_metadata()
             
-            if other_pollutants:
-                self.other_pollutants_label.setText(" | ".join(other_pollutants))
+            # Collect all pollutants that have values (no fallbacks - only show if value exists)
+            pollutant_strings = []
+            for param_name, value in weather_data.items():
+                if param_name not in excluded_fields and value is not None:
+                    try:
+                        # Ensure value is numeric
+                        float_value = float(value)
+                        formatted = self._format_pollutant_value(param_name, float_value, pollutant_metadata)
+                        pollutant_strings.append(formatted)
+                    except (ValueError, TypeError):
+                        # Skip non-numeric values
+                        continue
+            
+            # Display all pollutants (no fallback messages)
+            if pollutant_strings:
+                self.pollutants_label.setText(" | ".join(pollutant_strings))
             else:
-                self.other_pollutants_label.setText("")
+                self.pollutants_label.setText("")
             
             # Update time
             if timestamp:
@@ -151,9 +212,8 @@ class WeatherPanel(QWidget):
         else:
             self.temp_label.setText("--°C")
             self.details_label.setText("")
-            self.pm25_label.setText("PM2.5: --")
+            self.pollutants_label.setText("")
             self.aq_group.setStyleSheet("")
-            self.other_pollutants_label.setText("")
             self.update_label.setText("")
     
     

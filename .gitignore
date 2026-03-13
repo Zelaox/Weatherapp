@@ -34,6 +34,8 @@ ENV/
 # Application specific
 config.json
 weather.db
+.cursor/
+output/
 weather.db-shm
 weather.db-wal
 *.db-shm

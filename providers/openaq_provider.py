@@ -79,7 +79,7 @@ class OpenAQProvider(WeatherProvider):
         
         return None
     
-    def get_air_quality(self, latitude: float, longitude: float) -> Optional[Dict[str, Any]]:
+    def get_air_quality(self, latitude: float, longitude: float, max_age_hours: Optional[float] = None) -> Optional[Dict[str, Any]]:
         """
         Get raw pollutant values from nearest station.
         
