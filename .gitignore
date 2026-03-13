@@ -36,6 +36,10 @@ config.json
 weather.db
 .cursor/
 output/
+Demo/
+Bilder/
+Mickan.txt
+"2. Lightning Energy Budget.txt"
 weather.db-shm
 weather.db-wal
 *.db-shm
