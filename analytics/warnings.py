@@ -159,7 +159,7 @@ class WarningDetector:
         cities = self.db.get_all_cities()
         
         for city in cities:
-            pm25_avg = self.db.get_24h_rolling_average(city['id'], 'pm25')
+            pm25_avg = self.db.get_parameter_for_city_or_nearest(city['id'], 'pm25', hours=24)[0]
             if pm25_avg is not None:
                 level = self.get_warning_level(pm25_avg)
                 
@@ -194,7 +194,7 @@ class WarningDetector:
         cities = self.db.get_all_cities()
         
         for city in cities:
-            pm25_avg = self.db.get_24h_rolling_average(city['id'], 'pm25')
+            pm25_avg = self.db.get_parameter_for_city_or_nearest(city['id'], 'pm25', hours=24)[0]
             if pm25_avg is not None and pm25_avg > threshold:
                 aqi = calculate_aqi_from_pm25_24h(pm25_avg)
                 cities_over.append({
@@ -233,7 +233,7 @@ class WarningDetector:
         stats['total'] = len(cities)
         
         for city in cities:
-            pm25_avg = self.db.get_24h_rolling_average(city['id'], 'pm25')
+            pm25_avg = self.db.get_parameter_for_city_or_nearest(city['id'], 'pm25', hours=24)[0]
             if pm25_avg is None:
                 stats['no_data'] += 1
             else:

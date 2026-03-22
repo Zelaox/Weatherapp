@@ -119,30 +119,6 @@ class StormPanel(QWidget):
             return f"{label}: {value:.1f} {unit}"
         return f"{label}: Ingen data"
     
-    def _get_cape_category(self, cape: Optional[float]) -> str:
-        """
-        Get CAPE category description based on value.
-        
-        Args:
-            cape: CAPE value in J/kg
-            
-        Returns:
-            Category description string
-        """
-        if cape is None:
-            return ""
-        
-        if cape == 0:
-            return " (ingen konvektiv energi)"
-        elif cape < 100:
-            return " (svag)"
-        elif cape < 1000:
-            return " (måttlig)"
-        elif cape < 2500:
-            return " (stark)"
-        else:
-            return " (extrem)"
-    
     def refresh(self):
         """Refresh storm data display."""
         if not self.current_city_id:
@@ -184,7 +160,7 @@ class StormPanel(QWidget):
                 # CAPE (Convective Available Potential Energy)
                 cape = weather.get('cape') if weather else None
                 if cape is not None:
-                    cape_category = self._get_cape_category(cape)
+                    cape_category = self.db.get_cape_display_suffix_sv(cape)
                     self.cape_label.setText(f"CAPE: {cape:.1f} J/kg{cape_category}")
                 else:
                     self.cape_label.setText("CAPE: Ingen data")

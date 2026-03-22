@@ -12,7 +12,7 @@ import argparse
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
 import requests
 from zoneinfo import ZoneInfo
@@ -23,6 +23,12 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from database.db_manager import DatabaseManager  # type: ignore  # noqa: E402
+from analytics.normalization_engine import NormalizationEngine  # noqa: E402
+from analytics.solar_composite import calculate_solar_index_from_composite  # noqa: E402
+from providers.openmeteo_hourly_groups import (  # noqa: E402
+    build_hourly_groups_for_parameters,
+    hourly_groups_to_comma_string,
+)
 from utils.logger import WeatherLogger  # type: ignore  # noqa: E402
 from utils.config_loader import ConfigLoader  # type: ignore  # noqa: E402
 from utils.unit_conversion import convert_parameter_unit  # type: ignore  # noqa: E402
@@ -126,13 +132,16 @@ def load_openmeteo_mappings(db: DatabaseManager) -> Dict[str, str]:
 
 
 def discover_parameters_for_backfill(db: DatabaseManager, mappings: Dict[str, str]) -> List[str]:
-    """Hitta alla parametrar (weather/solar/storm) som både finns i registry och har Open-Meteo-mapping."""
+    """Hitta alla parametrar (weather/solar/storm) som både finns i registry, har Open-Meteo-mapping och archive tillåts."""
     params: List[str] = []
     for category in ("weather", "solar", "storm"):
         for p in db.get_parameters_by_category(category):
             name = p.get("parameter_name")
-            if name and name in mappings and name not in params:
-                params.append(name)
+            if not name or name not in mappings or name in params:
+                continue
+            if not db.parameter_allows_archive_backfill(name):
+                continue
+            params.append(name)
     return params
 
 
@@ -177,50 +186,56 @@ def backfill_city_openmeteo(
         logger.warning(f"[BACKFILL] Inga parametrar att hämta för {name}, hoppar över.")
         return
 
-    hourly_fields = build_hourly_param_string(param_names, mappings)
-    if not hourly_fields:
+    # Använd archive endpoint för ren historisk data (ingen forecast)
+    url = "https://archive-api.open-meteo.com/v1/archive"
+
+    end_date = datetime.now(CET).date()
+    start_date = end_date - timedelta(days=days)
+
+    groups = build_hourly_groups_for_parameters(
+        db,
+        endpoint_profile="archive-api",
+        parameter_names=param_names,
+        openmeteo_mappings=mappings,
+    )
+    if not groups:
         logger.warning(
-            f"[BACKFILL] Inga Open-Meteo-fält kunde byggas från provider_mappings för {name}, hoppar över."
+            f"[BACKFILL] Inga hourly-grupper (archive-api + variable_family) för {name}, hoppar över."
         )
         return
 
-    # Använd archive endpoint för ren historisk data (ingen forecast)
-    # Korrekt host för Open-Meteo archive API
-    url = "https://archive-api.open-meteo.com/v1/archive"
-    
-    # Beräkna start- och slutdatum baserat på days
-    end_date = datetime.now(CET).date()
-    start_date = end_date - timedelta(days=days)
-    
-    params = {
-        "latitude": lat,
-        "longitude": lon,
-        "hourly": hourly_fields,
-        "start_date": start_date.isoformat(),
-        "end_date": end_date.isoformat(),
-        "timezone": "auto",
-    }
-
-    logger.info(
-        f"[BACKFILL] Open-Meteo: Hämtar {days} dagars historik för {name} ({lat}, {lon}) "
-        f"med hourly={hourly_fields}"
-    )
-
-    def fetch_data():
-        resp = requests.get(url, params=params, timeout=30)
-        resp.raise_for_status()
-        return resp.json()
-
+    merged_hourly: Dict[str, Any] = {}
+    times: Optional[List[Any]] = None
     try:
-        data = fetch_data()
-        if data is None:
-            logger.error(f"[BACKFILL] Open-Meteo-förfrågan misslyckades för {name}: rate limit eller timeout")
-            return
+        for group in groups:
+            hourly_fields = hourly_groups_to_comma_string(group)
+            if not hourly_fields:
+                continue
+            req_params = {
+                "latitude": lat,
+                "longitude": lon,
+                "hourly": hourly_fields,
+                "start_date": start_date.isoformat(),
+                "end_date": end_date.isoformat(),
+                "timezone": "auto",
+            }
+            logger.info(
+                f"[BACKFILL] Open-Meteo archive: {name} hourly={hourly_fields} family={group.family_key}"
+            )
+            resp = requests.get(url, params=req_params, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+            ch = data.get("hourly") or {}
+            if times is None:
+                times = ch.get("time")
+            for k, v in ch.items():
+                if k != "time":
+                    merged_hourly[k] = v
     except Exception as e:
         logger.error(f"[BACKFILL] Open-Meteo-förfrågan misslyckades för {name}: {e}")
         return
 
-    hourly = data.get("hourly") or {}
+    hourly = {"time": times or [], **merged_hourly}
     times = hourly.get("time") or []
     if not times:
         logger.warning(f"[BACKFILL] Open-Meteo gav ingen hourly-tidsserie för {name}")
@@ -722,37 +737,10 @@ def calculate_and_save_solar_index_for_city(
             return
         
         logger.info(f"[BACKFILL] Beräknar solar_index för {len(rows)} datapunkter i {city_name}")
-        
-        # Hämta vikter från calibration_parameters
-        w1 = db.get_calibration_parameter('solar_index_radiation_weight')
-        w2 = db.get_calibration_parameter('solar_index_uv_weight')
-        w3 = db.get_calibration_parameter('solar_index_sunshine_weight')
-        
-        # Default weights
-        if w1 is None:
-            w1 = 0.5
-        else:
-            w1 = float(w1)
-        if w2 is None:
-            w2 = 0.3
-        else:
-            w2 = float(w2)
-        if w3 is None:
-            w3 = 0.2
-        else:
-            w3 = float(w3)
-        
-        # Normalize weights to sum to 1.0
-        total_weight = w1 + w2 + w3
-        if total_weight > 0:
-            w1 = w1 / total_weight
-            w2 = w2 / total_weight
-            w3 = w3 / total_weight
-        else:
-            w1, w2, w3 = 0.5, 0.3, 0.2
-        
+
+        norm_engine = NormalizationEngine(db)
         saved_count = 0
-        
+
         for row in rows:
             try:
                 data_id = row['id'] if isinstance(row, dict) or hasattr(row, 'keys') else row[0]
@@ -760,66 +748,27 @@ def calculate_and_save_solar_index_for_city(
                 solar_rad = row['solar_radiation'] if isinstance(row, dict) or hasattr(row, 'keys') else row[2]
                 uv_idx = row['uv_index'] if isinstance(row, dict) or hasattr(row, 'keys') else row[3]
                 sunshine = row['sunshine_duration'] if isinstance(row, dict) or hasattr(row, 'keys') else row[4]
-                
-                # Normalisera värden (använd samma logik som DerivedMetricsCalculator)
-                def normalize_param_value(value, param_name):
-                    """Normalize parameter value using winsorized bounds."""
-                    if value is None:
-                        return None
-                    bounds = db.get_parameter_winsorized_bounds(param_name, 5.0, 95.0)
-                    if bounds is None or bounds[0] is None or bounds[1] is None:
-                        return None
-                    lo, hi = bounds
-                    if hi <= lo:
-                        return None
-                    normalized = (value - lo) / (hi - lo)
-                    return max(0.0, min(1.0, normalized))
-                
-                solar_rad_norm = normalize_param_value(solar_rad, 'solar_radiation')
-                uv_norm = normalize_param_value(uv_idx, 'uv_index')
-                sunshine_norm = normalize_param_value(sunshine, 'sunshine_duration')
-                
-                # Bygg terms och weights
-                terms = []
-                weights = []
-                
-                if solar_rad_norm is not None:
-                    terms.append(solar_rad_norm)
-                    weights.append(w1)
-                
-                if uv_norm is not None:
-                    terms.append(uv_norm)
-                    weights.append(w2)
-                
-                if sunshine_norm is not None:
-                    terms.append(sunshine_norm)
-                    weights.append(w3)
-                
-                # Behöver minst en term
-                if not terms:
+
+                weather_row = {
+                    "solar_radiation": solar_rad,
+                    "uv_index": uv_idx,
+                    "sunshine_duration": sunshine,
+                }
+                solar_index, _tr = calculate_solar_index_from_composite(
+                    db, weather_row, norm_engine, debug_trace=False
+                )
+                if solar_index is None:
                     continue
-                
-                # Normalisera weights för tillgängliga terms
-                total_available_weight = sum(weights)
-                if total_available_weight > 0:
-                    weights = [w / total_available_weight for w in weights]
-                else:
-                    weights = [1.0 / len(weights)] * len(weights)
-                
-                # Beräkna solar_index
-                solar_index = sum(term * weight for term, weight in zip(terms, weights))
-                solar_index = max(0.0, min(1.0, solar_index))  # Clamp to [0, 1]
-                
-                # Spara i analytical_indices (eller uppdatera befintlig)
-                # Notera: measurement_timestamp används som timestamp för analytical_index
+
                 if isinstance(measurement_ts, str):
                     measurement_ts = datetime.fromisoformat(measurement_ts.replace('Z', '+00:00'))
-                
+
                 db.add_analytical_index(
                     city_id=city_id,
                     solar_index=solar_index,
                     storm_risk=None,
-                    smog_risk=None
+                    smog_risk=None,
+                    timestamp=measurement_ts,
                 )
                 saved_count += 1
                 

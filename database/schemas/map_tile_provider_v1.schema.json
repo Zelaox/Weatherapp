@@ -1,0 +1,47 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "map_tile_provider_v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "url_template",
+    "attribution",
+    "user_agent"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "map_tile_provider_v1"
+    },
+    "url_template": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Leaflet tile URL template (e.g. https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png)"
+    },
+    "attribution": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Must match the legal requirements of the tile provider referenced by url_template"
+    },
+    "user_agent": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Full HTTP User-Agent for QWebEngineProfile and policy compliance"
+    },
+    "subdomains": {
+      "type": "string",
+      "description": "Optional Leaflet subdomains string for {s}, e.g. abc"
+    },
+    "min_zoom": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 22
+    },
+    "max_zoom": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 22
+    }
+  }
+}

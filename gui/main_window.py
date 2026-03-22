@@ -643,91 +643,81 @@ class MainWindow(QMainWindow):
     def showEvent(self, event: QEvent):
         """Override showEvent to defer panel creation until after window is shown."""
         super().showEvent(event)
-        import time
         logger = logging.getLogger("WeatherApp.gui.main_window")
-        logger.info(f"[{time.time():.3f}] MainWindow.showEvent() - Window shown, deferring panel creation")
+        logger.debug("MainWindow.showEvent() — window shown, deferring panel creation")
         # Defer panel creation to next event loop cycle (after window is fully rendered)
         QTimer.singleShot(100, self._create_panels_lazily)
     
     def _create_panels_lazily(self):
         """Create panels lazily after window is shown."""
         import time
-        import traceback
         logger = logging.getLogger("WeatherApp.gui.main_window")
-        logger.info(f"[{time.time():.3f}] MainWindow._create_panels_lazily() - Starting deferred panel creation")
-        
+        logger.debug("MainWindow._create_panels_lazily() — starting")
+
         # Import panel modules
-        logger.debug("Importing panel modules")
+        logger.debug("Importing deferred panel modules")
         from gui.panels.solar_panel import SolarPanel
         from gui.panels.storm_panel import StormPanel
         from gui.panels.lightning_panel import LightningPanel
-        
+
         # Create SolarPanel
         if not self._panels_created['solar']:
             try:
-                logger.info(f"[{time.time():.3f}] Creating SolarPanel (deferred)...")
-                logger.info(f"[{time.time():.3f}] Stack trace before SolarPanel:\n{''.join(traceback.format_stack()[-5:])}")
                 solar_panel_start = time.time()
                 solar_panel = SolarPanel(self.controller.db)
-                logger.info(f"[{time.time():.3f}] SolarPanel created successfully (took {time.time() - solar_panel_start:.3f}s)")
-                
+                elapsed = time.time() - solar_panel_start
+                logger.debug("SolarPanel created (deferred) in %.3fs", elapsed)
+
                 # Replace placeholder with actual panel
                 tab_index = self.tabs.indexOf(self.solar_panel)
                 self.tabs.removeTab(tab_index)
                 self.solar_panel = solar_panel
                 self.tabs.insertTab(tab_index, self.solar_panel, "Sol")
                 self._panels_created['solar'] = True
-                logger.info(f"[{time.time():.3f}] SolarPanel placeholder replaced with actual panel")
             except Exception as e:
-                logger.error(f"[{time.time():.3f}] Failed to create SolarPanel: {e}", exc_info=True)
+                logger.error("Failed to create SolarPanel: %s", e, exc_info=True)
                 self.solar_panel.setText(f"Solar panel failed to initialize: {e}")
-                logger.warning(f"[{time.time():.3f}] Using placeholder for SolarPanel")
-        
+                logger.warning("Using placeholder for SolarPanel")
+
         # Create StormPanel
         if not self._panels_created['storm']:
             try:
-                logger.info(f"[{time.time():.3f}] Creating StormPanel (deferred)...")
-                logger.info(f"[{time.time():.3f}] Stack trace before StormPanel:\n{''.join(traceback.format_stack()[-5:])}")
                 storm_panel_start = time.time()
                 storm_panel = StormPanel(self.controller.db)
-                logger.info(f"[{time.time():.3f}] StormPanel created successfully (took {time.time() - storm_panel_start:.3f}s)")
-                
+                elapsed = time.time() - storm_panel_start
+                logger.debug("StormPanel created (deferred) in %.3fs", elapsed)
+
                 # Replace placeholder with actual panel
                 tab_index = self.tabs.indexOf(self.storm_panel)
                 self.tabs.removeTab(tab_index)
                 self.storm_panel = storm_panel
                 self.tabs.insertTab(tab_index, self.storm_panel, "Åska")
                 self._panels_created['storm'] = True
-                logger.info(f"[{time.time():.3f}] StormPanel placeholder replaced with actual panel")
             except Exception as e:
-                logger.error(f"[{time.time():.3f}] Failed to create StormPanel: {e}", exc_info=True)
-                import traceback
-                logger.error(f"[{time.time():.3f}] StormPanel creation traceback:\n{traceback.format_exc()}")
+                logger.error("Failed to create StormPanel: %s", e, exc_info=True)
                 self.storm_panel.setText(f"Storm panel failed to initialize: {e}")
-                logger.warning(f"[{time.time():.3f}] Using placeholder for StormPanel")
-        
+                logger.warning("Using placeholder for StormPanel")
+
         # Create LightningPanel
         if not self._panels_created['lightning']:
             try:
-                logger.info(f"[{time.time():.3f}] Creating LightningPanel (deferred)...")
-                logger.info(f"[{time.time():.3f}] Stack trace before LightningPanel:\n{''.join(traceback.format_stack()[-5:])}")
                 lightning_panel_start = time.time()
                 lightning_panel = LightningPanel(self.controller.db)
-                logger.info(f"[{time.time():.3f}] LightningPanel created successfully (took {time.time() - lightning_panel_start:.3f}s)")
-                
+                elapsed = time.time() - lightning_panel_start
+                logger.debug("LightningPanel created (deferred) in %.3fs", elapsed)
+
                 # Replace placeholder with actual panel
                 tab_index = self.tabs.indexOf(self.lightning_panel)
                 self.tabs.removeTab(tab_index)
                 self.lightning_panel = lightning_panel
                 self.tabs.insertTab(tab_index, self.lightning_panel, "Blixtar")
                 self._panels_created['lightning'] = True
-                logger.info(f"[{time.time():.3f}] LightningPanel placeholder replaced with actual panel")
             except Exception as e:
-                logger.error(f"[{time.time():.3f}] Failed to create LightningPanel: {e}", exc_info=True)
+                logger.error("Failed to create LightningPanel: %s", e, exc_info=True)
                 self.lightning_panel.setText(f"Lightning panel failed to initialize: {e}")
-                logger.warning(f"[{time.time():.3f}] Using placeholder for LightningPanel")
-        
-        logger.info(f"[{time.time():.3f}] MainWindow._create_panels_lazily() - Deferred panel creation complete")
+                logger.warning("Using placeholder for LightningPanel")
+
+        logger.debug("MainWindow._create_panels_lazily() — complete")
     
     def refresh_all(self):
         """Refresh all UI components."""

@@ -2,7 +2,6 @@
 
 import json
 import math
-import tempfile
 import os
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
@@ -18,12 +17,18 @@ from zoneinfo import ZoneInfo
 import logging
 from utils.parameter_formatter import format_parameter_name
 from analytics.warnings import WarningDetector
+from analytics.normalization_engine import NormalizationEngine
+from analytics.heatmap_interpolation import compute_pm25_heatmap
+from utils.local_map_server import map_document_server_url, set_map_document_html
 
 # Try to import QWebEngineView (optional dependency)
 try:
-    from PyQt5.QtWebEngineWidgets import QWebEngineView
+    from PyQt5.QtWebEngineWidgets import QWebEngineView, QWebEngineProfile, QWebEnginePage
     WEBENGINE_AVAILABLE = True
 except ImportError:
+    QWebEngineView = None  # type: ignore[misc, assignment]
+    QWebEngineProfile = None  # type: ignore[misc, assignment]
+    QWebEnginePage = None  # type: ignore[misc, assignment]
     WEBENGINE_AVAILABLE = False
 
 logger = logging.getLogger("WeatherApp.gui.stations_tab")
@@ -57,10 +62,137 @@ class MapDataBuilder:
       D  Station density map (self-calibrating heatmap radius per city)
     """
 
-    def __init__(self, db, warning_detector: WarningDetector):
+    def __init__(self, db, warning_detector: WarningDetector, debug_mode: bool = False):
         self.db = db
         self.detector = warning_detector
+        self.debug_mode = bool(debug_mode)
         self._calibration_cache = None  # Cache calibration params per build() call
+        self._norm_engine = NormalizationEngine(db)
+
+    def _build_heatmap_confidence(
+        self,
+        n_stations: int,
+        coverage_fraction: float,
+        total_cells: int,
+        mean_interpolation_distance_km: Optional[float],
+        calib: Dict,
+        *,
+        debug_trace: bool = False,
+    ) -> Dict:
+        """
+        DB-driven heatmap confidence: gated levels + weighted score from components normalized
+        via normalization_profile (heatmap_conf_* keys) and calibration weights/thresholds.
+        """
+        low_n = float(calib["heatmap_confidence_low_min_stations"])
+        unr_n = float(calib["heatmap_confidence_unreliable_min_stations"])
+        low_cov = float(calib["heatmap_confidence_low_max_coverage_fraction"])
+        unr_cov = float(calib["heatmap_confidence_unreliable_max_coverage_fraction"])
+        w_s = float(calib["heatmap_confidence_w_station"])
+        w_c = float(calib["heatmap_confidence_w_coverage"])
+        w_d = float(calib["heatmap_confidence_w_distance"])
+        score_unreliable_below = float(calib["heatmap_confidence_score_unreliable_below"])
+        score_low_below = float(calib["heatmap_confidence_score_low_below"])
+        formula_version = float(calib["heatmap_confidence_formula_version"])
+
+        w_sum = w_s + w_c + w_d
+        if abs(w_sum - 1.0) > 0.02:
+            raise RuntimeError(
+                f"heatmap confidence weights must sum to 1.0 (got {w_sum} from DB calibration)"
+            )
+        if score_unreliable_below >= score_low_below:
+            raise RuntimeError(
+                "heatmap_confidence_score_unreliable_below must be < heatmap_confidence_score_low_below"
+            )
+
+        eng = self._norm_engine
+        s_station_t, tr_st = eng.normalize_by_profile_key(
+            "heatmap_conf_station_count", float(n_stations), debug_trace=debug_trace
+        )
+        s_cov_t, tr_cov = eng.normalize_by_profile_key(
+            "heatmap_conf_coverage_fraction", float(coverage_fraction), debug_trace=debug_trace
+        )
+        if s_station_t is None or s_cov_t is None:
+            raise RuntimeError(
+                "heatmap confidence: station or coverage normalization returned None (check normalization_profile)"
+            )
+        s_station = float(s_station_t)
+        s_cov = float(s_cov_t)
+
+        reasons: List[str] = []
+        gate_level = "ok"
+        if total_cells <= 0 or n_stations < unr_n or coverage_fraction < unr_cov:
+            gate_level = "unreliable"
+            if n_stations < unr_n:
+                reasons.append("few_stations")
+            if coverage_fraction < unr_cov:
+                reasons.append("low_coverage_fraction")
+        elif n_stations < low_n or coverage_fraction < low_cov:
+            gate_level = "low"
+            if n_stations < low_n:
+                reasons.append("stations_below_low_threshold")
+            if coverage_fraction < low_cov:
+                reasons.append("coverage_below_low_threshold")
+
+        mean_km = mean_interpolation_distance_km
+        s_dist: Optional[float] = None
+        tr_dist = None
+        if mean_km is not None:
+            norm_d, tr_dist = eng.normalize_by_profile_key(
+                "heatmap_conf_mean_distance_km", float(mean_km), debug_trace=debug_trace
+            )
+            if norm_d is None:
+                raise RuntimeError(
+                    "heatmap confidence: mean distance normalization returned None (check normalization_profile)"
+                )
+            s_dist = 1.0 - float(norm_d)
+
+        if s_dist is None:
+            w_den = w_s + w_c
+            if w_den <= 0:
+                raise RuntimeError("heatmap_confidence_w_station + w_coverage must be > 0 when distance unknown")
+            w_eff_s = w_s / w_den
+            w_eff_c = w_c / w_den
+            score = w_eff_s * s_station + w_eff_c * s_cov
+            comp_distance = None
+        else:
+            score = w_s * s_station + w_c * s_cov + w_d * s_dist
+            comp_distance = round(s_dist, 4)
+
+        score = _clamp(float(score), 0.0, 1.0)
+
+        score_level = "ok"
+        if score < score_unreliable_below:
+            score_level = "unreliable"
+            reasons.append("score_below_unreliable_threshold")
+        elif score < score_low_below:
+            score_level = "low"
+            reasons.append("score_below_low_threshold")
+
+        order = {"ok": 0, "low": 1, "unreliable": 2}
+        level = gate_level if order[gate_level] >= order[score_level] else score_level
+
+        out: Dict = {
+            "level": level,
+            "score": round(score, 4),
+            "reasons": reasons,
+            "coverage_fraction": round(coverage_fraction, 4),
+            "n_stations": n_stations,
+            "grid_cells_total": int(total_cells),
+            "mean_interpolation_distance_km": round(mean_km, 3) if mean_km is not None else None,
+            "formula_version": formula_version,
+            "components": {
+                "station_score": round(s_station, 4),
+                "coverage_score": round(s_cov, 4),
+                "distance_score": comp_distance,
+            },
+        }
+        if debug_trace:
+            out["debug"] = {
+                "gate_level": gate_level,
+                "score_level": score_level,
+                "traces": {"station": tr_st, "coverage": tr_cov, "distance": tr_dist},
+            }
+        return out
     
     def _get_calibration_params(self) -> Dict[str, float]:
         """
@@ -84,9 +216,23 @@ class MapDataBuilder:
             required_idw = [
                 'idw_power', 'idw_max_r_factor', 'idw_scale_percentile'
             ]
-            
+            required_heatmap_contract = [
+                "heatmap_confidence_low_min_stations",
+                "heatmap_confidence_unreliable_min_stations",
+                "heatmap_confidence_low_max_coverage_fraction",
+                "heatmap_confidence_unreliable_max_coverage_fraction",
+                "heatmap_confidence_w_station",
+                "heatmap_confidence_w_coverage",
+                "heatmap_confidence_w_distance",
+                "heatmap_confidence_score_unreliable_below",
+                "heatmap_confidence_score_low_below",
+                "heatmap_confidence_formula_version",
+                "map_init_size_ready_timeout_ms",
+                "normalization_winsor_min_samples",
+            ]
+
             missing = []
-            for key in required_inversion + required_idw:
+            for key in required_inversion + required_idw + required_heatmap_contract:
                 if key not in params or params[key] is None:
                     missing.append(key)
             
@@ -166,7 +312,9 @@ class MapDataBuilder:
             }
         """
         # ---- Fetch base data ----
-        city_weather = self.db.get_cities_with_weather_for_map()
+        all_cities = self.db.get_all_cities()
+        city_weather_list = self.db.get_cities_with_weather_for_map()
+        city_weather_by_id = {cw["city_id"]: cw for cw in city_weather_list}
         all_sensors  = self.db.get_all_sensors()
         national_7d  = self.db.get_national_pm25_7day_average()
 
@@ -214,15 +362,21 @@ class MapDataBuilder:
             "bounds_available": bounds_available,
         }
 
-        # ---- Build per-city enriched records ----
+        # ---- Build per-city enriched records (all cities; PM2.5 from own or nearest station) ----
         cities_out = []
         valid_cities = []   # only cities with pm25_24h != None
 
-        for cw in city_weather:
-            city_id = cw["city_id"]
+        for city in all_cities:
+            city_id = city["id"]
+            cw = city_weather_by_id.get(city_id)
 
-            # 24-hour rolling PM2.5
-            pm25_24h = self.db.get_24h_rolling_average(city_id, "pm25")
+            # PM2.5: own data or nearest station within radius (read-side fallback)
+            pm25_24h, _src_id, src_name, dist_km = self.db.get_parameter_for_city_or_nearest(
+                city_id, "pm25", hours=24
+            )
+            pm25_source_label = None
+            if pm25_24h is not None and dist_km is not None and dist_km > 0 and src_name:
+                pm25_source_label = f"{src_name} ({dist_km:.0f} km)"
 
             # AQI level + colour — single source of truth: WarningDetector
             if pm25_24h is not None:
@@ -234,21 +388,20 @@ class MapDataBuilder:
                 color = "#cccccc"
                 level_name = "Ingen data"
 
-            # 24-hour PM2.5 trend (list of {ts, pm25})
-            history = self.db.get_weather_history(city_id, hours=24)
-            trend_24h = [
-                {
-                    "ts":   str(h.get("timestamp", "")),
-                    "pm25": h.get("pm25"),
-                }
-                for h in history
-                if h.get("pm25") is not None
-            ]
+            # 24-hour PM2.5 trend (only when city has own weather data)
+            if cw:
+                history = self.db.get_weather_history(city_id, hours=24)
+                trend_24h = [
+                    {"ts": str(h.get("timestamp", "")), "pm25": h.get("pm25")}
+                    for h in history if h.get("pm25") is not None
+                ]
+            else:
+                trend_24h = []
 
-            # Inversion score
+            # Inversion score (requires wind/humidity from own weather)
             inversion_score = self._compute_inversion_score(
-                wind_speed=cw.get("wind_speed"),
-                humidity=cw.get("humidity"),
+                wind_speed=cw.get("wind_speed") if cw else None,
+                humidity=cw.get("humidity") if cw else None,
                 wind_lo=wind_lo, wind_hi=wind_hi,
                 hum_lo=hum_lo,   hum_hi=hum_hi,
                 wind_range=wind_range, hum_range=hum_range,
@@ -257,24 +410,26 @@ class MapDataBuilder:
             )
 
             record = {
-                "city_id":         city_id,
-                "city_name":       cw["city_name"],
-                "latitude":        cw["latitude"],
-                "longitude":       cw["longitude"],
-                "pm25_24h":        pm25_24h,
-                "aqi_level":       level,
-                "aqi_color":       color,
-                "aqi_level_name":  level_name,
-                "temperature":     cw.get("temperature"),
-                "humidity":        cw.get("humidity"),
-                "wind_speed":      cw.get("wind_speed"),
-                "no2":             cw.get("no2"),
-                "o3":              cw.get("o3"),
-                "trend_24h":       trend_24h,
-                "inversion_score": inversion_score,
-                "low_density":     False,   # filled below in section D
-                "density_radius":  0,       # filled below in section D
-                "cluster_region":  None,    # filled below in section B
+                "city_id":          city_id,
+                "city_name":        city["name"],
+                "latitude":         city["latitude"],
+                "longitude":        city["longitude"],
+                "measurement_ts":   (cw.get("measurement_ts") if cw else None),
+                "pm25_24h":         pm25_24h,
+                "pm25_source_label": pm25_source_label,
+                "aqi_level":        level,
+                "aqi_color":        color,
+                "aqi_level_name":   level_name,
+                "temperature":      cw.get("temperature") if cw else None,
+                "humidity":         cw.get("humidity") if cw else None,
+                "wind_speed":       cw.get("wind_speed") if cw else None,
+                "no2":              cw.get("no2") if cw else None,
+                "o3":               cw.get("o3") if cw else None,
+                "trend_24h":        trend_24h,
+                "inversion_score":  inversion_score,
+                "low_density":      False,
+                "density_radius":   0,
+                "cluster_region":   None,
             }
             cities_out.append(record)
 
@@ -302,15 +457,119 @@ class MapDataBuilder:
         calib = self._get_calibration_params()
         idw_scale_percentile = calib['idw_scale_percentile']
         
-        idw_grid, idw_meta = self._compute_idw_grid(valid_cities, extent=map_extent)
-        if idw_grid:
-            _vals        = sorted(row[2] for row in idw_grid)
-            _idx         = min(int(len(_vals) * idw_scale_percentile / 100), len(_vals) - 1)
-            idw_max      = _vals[_idx]   # colour scale anchor at idw_scale_percentile
-            idw_true_max = _vals[-1]     # actual grid maximum — UI clamp indicator only
+        if not valid_cities:
+            idw_grid_raw, idw_meta = [], {}
+            heatmap_extra = {
+                "heatmap_confidence": self._build_heatmap_confidence(
+                    n_stations=0,
+                    coverage_fraction=0.0,
+                    total_cells=0,
+                    mean_interpolation_distance_km=None,
+                    calib=calib,
+                    debug_trace=self.debug_mode,
+                ),
+                "engine_config": {},
+                "heatmap_meta": {},
+                "warning_codes": [],
+            }
         else:
-            idw_max      = 1.0
+            idw_grid_raw, idw_meta, heatmap_extra = compute_pm25_heatmap(
+                self.db,
+                valid_cities,
+                map_extent,
+                calib,
+                context_key="pm25_heatmap",
+                debug_mode=self.debug_mode,
+            )
+        total_cells = 0
+        if idw_meta:
+            try:
+                g_n = int(idw_meta.get("grid_n", 0))
+                total_cells = max(0, g_n * g_n)
+            except (TypeError, ValueError):
+                total_cells = 0
+
+        # Optional smoothing (DB-driven)
+        kernel = calib.get('heatmap_smoothing_kernel_size', 3.0)
+        try:
+            kernel = int(kernel)
+        except (TypeError, ValueError):
+            kernel = 3
+        if kernel > 1 and idw_grid_raw:
+            idw_grid = self._smooth_idw_grid(idw_grid_raw, idw_meta, kernel_size=kernel)
+        else:
+            idw_grid = idw_grid_raw
+
+        if idw_grid:
+            _vals = sorted(row[2] for row in idw_grid)
+            _idx = min(int(len(_vals) * idw_scale_percentile / 100), len(_vals) - 1)
+            idw_max = _vals[_idx]      # colour scale anchor at idw_scale_percentile
+            idw_true_max = _vals[-1]   # actual grid maximum — UI clamp indicator only
+        else:
+            _vals = []
+            idw_max = 1.0
             idw_true_max = 1.0
+
+        coverage_smooth = 0.0
+        if total_cells > 0:
+            coverage_raw = len(idw_grid_raw) / total_cells if idw_grid_raw else 0.0
+            coverage_smooth = len(idw_grid) / total_cells if idw_grid else 0.0
+            # Edge-band (yttersta 3 rader/kolumner) coverage efter smoothing
+            edge_band = 3
+            edge_count = 0
+            if idw_grid and idw_meta:
+                lat_min = float(idw_meta["lat_min"])
+                lon_min = float(idw_meta["lon_min"])
+                lat_step = float(idw_meta["lat_step"])
+                lon_step = float(idw_meta["lon_step"])
+                g_n = int(idw_meta["grid_n"])
+                for lat, lon, _v in idw_grid:
+                    col = int(round((lon - lon_min) / lon_step))
+                    row = int(round((lat - lat_min) / lat_step))
+                    if (
+                        row < edge_band
+                        or row >= g_n - edge_band
+                        or col < edge_band
+                        or col >= g_n - edge_band
+                    ):
+                        edge_count += 1
+            logger.info(
+                "[Heatmap] Coverage: raw=%d/%.0f (%.1f%%), smooth=%d/%.0f (%.1f%%), edge_cells_with_values=%d",
+                len(idw_grid_raw) if idw_grid_raw else 0,
+                float(total_cells),
+                coverage_raw * 100.0,
+                len(idw_grid) if idw_grid else 0,
+                float(total_cells),
+                coverage_smooth * 100.0,
+                edge_count,
+            )
+
+        heatmap_confidence = heatmap_extra.get("heatmap_confidence") or {}
+        if not heatmap_confidence:
+            raise RuntimeError("compute_pm25_heatmap returned empty heatmap_confidence")
+
+        hc_vis = self.db.get_heatmap_confidence_visual_mapping()
+        for lvl in ("ok", "low", "unreliable"):
+            if lvl not in hc_vis:
+                raise RuntimeError(
+                    f"heatmap_confidence_visual_mapping missing row for confidence_level={lvl!r}"
+                )
+
+        wms = calib.get("normalization_winsor_min_samples")
+        norm_report = self.db.get_normalization_readiness_report(
+            winsor_min_samples=max(1, int(wms)) if wms is not None else 20
+        )
+        unusable_names = [
+            p["parameter_name"]
+            for p in norm_report.get("parameters", [])
+            if p.get("status") == "unusable"
+        ]
+        normalization_readiness = {
+            "unusable_parameters": unusable_names,
+            "unstable_count": int(norm_report.get("unstable_count", 0)),
+            "unusable_count": int(norm_report.get("unusable_count", 0)),
+            "registry_revision": norm_report.get("registry_revision"),
+        }
 
         logger.info(
             f"[Heatmap] IDW scale: p{idw_scale_percentile}={idw_max:.2f} µg/m³  "
@@ -369,6 +628,36 @@ class MapDataBuilder:
         if idw_grid:
             pm25_values = [row[2] for row in idw_grid]
             pm25_p5, pm25_p95 = _compute_percentile_scale(pm25_values, 5.0, idw_scale_percentile)
+
+        # Heatmap value domain / clipping (fully DB-driven)
+        clip_min = calib.get('heatmap_clip_min')
+        clip_max = calib.get('heatmap_clip_max')
+        try:
+            clip_min_f = float(clip_min) if clip_min is not None else None
+        except (TypeError, ValueError):
+            clip_min_f = None
+        try:
+            clip_max_f = float(clip_max) if clip_max is not None else None
+        except (TypeError, ValueError):
+            clip_max_f = None
+
+        # Fallbacks: derive from current grid if DB values are unusable
+        if idw_grid and (clip_min_f is None or clip_max_f is None or clip_min_f >= clip_max_f):
+            vals = _vals or sorted(row[2] for row in idw_grid)
+            if vals:
+                clip_min_f = vals[0]
+                clip_max_f = vals[-1]
+        if clip_min_f is None:
+            clip_min_f = 0.0
+        if clip_max_f is None or clip_max_f <= clip_min_f:
+            clip_max_f = clip_min_f + 1.0
+
+        heatmap_config = {
+            "value_min": pm25_p5,
+            "value_max": pm25_p95,
+            "clip_min": clip_min_f,
+            "clip_max": clip_max_f,
+        }
         
         # Solar scaling (p5-p95)
         solar_p5, solar_p95 = None, None
@@ -385,7 +674,7 @@ class MapDataBuilder:
         # Build timestamp for cache-busting
         build_timestamp = datetime.now(ZoneInfo("Europe/Stockholm"))
 
-        return {
+        payload_out = {
             "cities":         cities_out,
             "sensors":        sensors_out,
             "cluster_alerts": cluster_alerts,
@@ -398,6 +687,14 @@ class MapDataBuilder:
             "idw_scale_percentile": idw_scale_percentile,  # For JS template
             "pm25_p5":        pm25_p5,
             "pm25_p95":       pm25_p95,
+            "heatmap_confidence": heatmap_confidence,
+            "heatmap_engine": heatmap_extra.get("engine_config") or {},
+            "heatmap_meta": heatmap_extra.get("heatmap_meta") or {},
+            "heatmap_warnings": heatmap_extra.get("warning_codes") or [],
+            "heatmap_confidence_visual": hc_vis,
+            "map_init_timeout_ms": int(calib["map_init_size_ready_timeout_ms"]),
+            "normalization_readiness": normalization_readiness,
+            "heatmap_config": heatmap_config,
             "solar_layer":    solar_layer,
             "solar_idw_grid": solar_idw_grid,
             "solar_idw_meta": solar_idw_meta,
@@ -413,6 +710,29 @@ class MapDataBuilder:
             "build_timestamp": build_timestamp.isoformat(),
             "data_freshness_seconds": 0,  # Always fresh
         }
+        if self.debug_mode:
+            payload_out["map_debug"] = {
+                "heatmap_confidence": dict(heatmap_confidence),
+                "heatmap_engine": heatmap_extra.get("engine_config") or {},
+                "heatmap_extra": {k: v for k, v in heatmap_extra.items() if k != "heatmap_confidence"},
+                "pm25_idw_cell_count": len(idw_grid or []),
+                "normalization_readiness_full": norm_report,
+                "calibration_keys_heatmap_confidence": [
+                    "heatmap_confidence_low_min_stations",
+                    "heatmap_confidence_unreliable_min_stations",
+                    "heatmap_confidence_low_max_coverage_fraction",
+                    "heatmap_confidence_unreliable_max_coverage_fraction",
+                    "heatmap_confidence_w_station",
+                    "heatmap_confidence_w_coverage",
+                    "heatmap_confidence_w_distance",
+                    "heatmap_confidence_score_unreliable_below",
+                    "heatmap_confidence_score_low_below",
+                    "heatmap_confidence_formula_version",
+                    "map_init_size_ready_timeout_ms",
+                    "normalization_winsor_min_samples",
+                ],
+            }
+        return payload_out
 
     # ------------------------------------------------------------------
     # Section C — winsorized inversion score
@@ -552,104 +872,8 @@ class MapDataBuilder:
             city["low_density"]    = count < 2
 
     # ------------------------------------------------------------------
-    # Section E — IDW grid interpolation
+    # Section E — IDW grid interpolation (PM2.5: analytics/heatmap_interpolation.compute_pm25_heatmap)
     # ------------------------------------------------------------------
-
-    def _compute_idw_grid(
-        self,
-        valid_cities: List[Dict],
-        extent: Optional[Tuple[float, float, float, float]] = None,
-    ) -> Tuple[List[List[float]], Dict]:
-        """
-        Inverse Distance Weighting interpolation over a regular grid.
-        Bounding box: from optional extent (lat_min, lat_max, lon_min, lon_max),
-        or from valid_cities + 5% padding. Power and max_r_factor from DB.
-
-        Returns:
-            Tuple of (grid, meta). Grid cells without any station within max_r are omitted.
-        """
-        if not valid_cities:
-            return [], {}
-
-        lats = [c["latitude"]  for c in valid_cities]
-        lons = [c["longitude"] for c in valid_cities]
-        vals = [c["pm25_24h"]  for c in valid_cities]
-        n    = len(valid_cities)
-
-        if extent is not None:
-            lat_min, lat_max, lon_min, lon_max = extent
-            # Optional 5% padding so edges are not clipped
-            lat_pad = (lat_max - lat_min) * 0.05
-            lon_pad = (lon_max - lon_min) * 0.05
-            lat_min -= lat_pad
-            lat_max += lat_pad
-            lon_min -= lon_pad
-            lon_max += lon_pad
-        else:
-            # Bounding box: actual station extents + 5% proportional padding on each side
-            lat_min, lat_max = min(lats), max(lats)
-            lon_min, lon_max = min(lons), max(lons)
-            lat_pad = (lat_max - lat_min) * 0.05
-            lon_pad = (lon_max - lon_min) * 0.05
-            lat_min -= lat_pad
-            lat_max += lat_pad
-            lon_min -= lon_pad
-            lon_max += lon_pad
-
-        # Grid resolution: scales with station density, bounded [80, 150] for better smoothing
-        # Higher resolution reduces visible bands and improves edge smoothness
-        grid_n = max(80, min(150, int(math.sqrt(n) * 10)))
-        
-        # Get IDW parameters from DB
-        calib = self._get_calibration_params()
-        idw_power = calib['idw_power']
-        idw_max_r_factor = calib['idw_max_r_factor']
-        
-        # Max IDW influence radius: tightened by idw_max_r_factor so each
-        # station covers roughly its Voronoi cell without excessive bleed.
-        diag  = math.sqrt((lat_max - lat_min) ** 2 + (lon_max - lon_min) ** 2)
-        max_r = diag / (math.sqrt(n) * idw_max_r_factor)
-
-        lat_step = (lat_max - lat_min) / grid_n
-        lon_step = (lon_max - lon_min) / grid_n
-
-        grid = []
-        for i in range(grid_n):
-            glat = lat_min + i * lat_step
-            for j in range(grid_n):
-                glon = lon_min + j * lon_step
-                num = den = 0.0
-                for slat, slon, sval in zip(lats, lons, vals):
-                    d = math.sqrt((glat - slat) ** 2 + (glon - slon) ** 2)
-                    if d < 1e-9:          # coincident with station — exact value
-                        num, den = sval, 1.0
-                        break
-                    if d <= max_r:
-                        w    = 1.0 / (d ** idw_power)   # idw_power controls locality (from DB)
-                        num += w * sval
-                        den += w
-                if den > 0:
-                    grid.append([
-                        round(glat, 5),
-                        round(glon, 5),
-                        round(num / den, 3),
-                    ])
-
-        logger.info(
-            f"[Heatmap] IDW grid: {grid_n}×{grid_n} cells, "
-            f"{len(grid)} non-empty, n_stations={n}, max_r={max_r:.3f}°"
-        )
-
-        meta = {
-            "lat_min":  lat_min,
-            "lat_max":  lat_max,
-            "lon_min":  lon_min,
-            "lon_max":  lon_max,
-            "grid_n":   grid_n,
-            "lat_step": lat_step,
-            "lon_step": lon_step,
-        }
-        return grid, meta
 
     def _compute_layer_idw_grid(
         self,
@@ -691,7 +915,7 @@ class MapDataBuilder:
             lon_min -= lon_pad
             lon_max += lon_pad
         
-        # Grid resolution: scales with station density, bounded [80, 150] for better smoothing
+        # Grid resolution: scales with station density, bounded [80, 150]
         grid_n = max(80, min(150, int(math.sqrt(n) * 10)))
         
         # Get layer-specific IDW parameters (or use defaults)
@@ -699,12 +923,28 @@ class MapDataBuilder:
         idw_power_key = f'{layer_name}_idw_power'
         idw_max_r_factor_key = f'{layer_name}_idw_max_r_factor'
         
-        idw_power = calib.get(idw_power_key) or calib.get('idw_power', 2.3)
-        idw_max_r_factor = calib.get(idw_max_r_factor_key) or calib.get('idw_max_r_factor', 1.3)
+        base_power = calib.get('idw_power', 2.3)
+        layer_power = calib.get(idw_power_key, base_power)
+        idw_power = float(layer_power if layer_power is not None else base_power)
         
-        # Max IDW influence radius
-        diag = math.sqrt((lat_max - lat_min) ** 2 + (lon_max - lon_min) ** 2)
-        max_r = diag / (math.sqrt(n) * idw_max_r_factor)
+        base_r_factor = calib.get('idw_max_r_factor', 1.3)
+        layer_r_factor = calib.get(idw_max_r_factor_key, base_r_factor)
+        idw_max_r_factor = float(layer_r_factor if layer_r_factor is not None else base_r_factor)
+        
+        # Max IDW influence radius in km, derived from diagonal extent
+        diag_deg = math.sqrt((lat_max - lat_min) ** 2 + (lon_max - lon_min) ** 2)
+        approx_km = diag_deg * 111.0
+        max_radius_km = approx_km / (math.sqrt(n) * max(idw_max_r_factor, 0.1))
+        max_radius_km = max(1.0, max_radius_km)
+        
+        def _distance_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+            lat1_rad = math.radians(lat1)
+            lat2_rad = math.radians(lat2)
+            dlat = lat2_rad - lat1_rad
+            dlon = math.radians(lon2 - lon1)
+            x = dlon * math.cos((lat1_rad + lat2_rad) * 0.5)
+            y = dlat
+            return 6371.0 * math.sqrt(x * x + y * y)
         
         lat_step = (lat_max - lat_min) / grid_n
         lon_step = (lon_max - lon_min) / grid_n
@@ -716,12 +956,12 @@ class MapDataBuilder:
                 glon = lon_min + j * lon_step
                 num = den = 0.0
                 for slat, slon, sval in zip(lats, lons, vals):
-                    d = math.sqrt((glat - slat) ** 2 + (glon - slon) ** 2)
-                    if d < 1e-9:  # coincident with station
+                    d_km = _distance_km(glat, glon, slat, slon)
+                    if d_km < 1e-3:  # coincident with station
                         num, den = sval, 1.0
                         break
-                    if d <= max_r:
-                        w = 1.0 / (d ** idw_power)
+                    if d_km <= max_radius_km:
+                        w = 1.0 / max(d_km ** idw_power, 1e-9)
                         num += w * sval
                         den += w
                 if den > 0:
@@ -741,6 +981,91 @@ class MapDataBuilder:
             "lon_step": lon_step,
         }
         return grid, meta
+
+    # ------------------------------------------------------------------
+    # Section E2 — smoothing helpers for IDW grids (NaN-aware)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _smooth_idw_grid(
+        grid: List[List[float]],
+        meta: Dict,
+        kernel_size: int,
+    ) -> List[List[float]]:
+        """
+        Apply a simple NaN-aware box smoothing over an IDW grid.
+
+        The input grid is a sparse list of [lat, lon, value] triples; cells that
+        are missing in this list are treated as NaN. The output has the same
+        sparse structure, with each cell averaged over its neighbourhood.
+        """
+        if not grid or not meta:
+            return grid
+
+        try:
+            n = int(meta.get("grid_n", 0))
+        except (TypeError, ValueError):
+            return grid
+        if n <= 0:
+            return grid
+
+        # Ensure odd kernel and at least 3x3
+        if kernel_size < 1:
+            return grid
+        if kernel_size % 2 == 0:
+            kernel_size += 1
+        if kernel_size < 3:
+            kernel_size = 3
+
+        lat_min = float(meta["lat_min"])
+        lon_min = float(meta["lon_min"])
+        lat_step = float(meta["lat_step"])
+        lon_step = float(meta["lon_step"])
+
+        # Build dense matrix initialised with NaN
+        dense = [[math.nan for _ in range(n)] for _ in range(n)]
+        for lat, lon, val in grid:
+            col = int(round((lon - lon_min) / lon_step))
+            row = int(round((lat - lat_min) / lat_step))
+            # y index inverted (north at top) is handled only when rendering,
+            # not in this smoothing space.
+            if 0 <= row < n and 0 <= col < n:
+                dense[row][col] = float(val)
+
+        radius = kernel_size // 2
+        smoothed: List[List[float]] = []
+        for row in range(n):
+            for col in range(n):
+                centre_val = dense[row][col]
+                if math.isnan(centre_val):
+                    # Keep NaN cells NaN to avoid inventing values far from stations
+                    continue
+                acc = 0.0
+                cnt = 0
+                for dr in range(-radius, radius + 1):
+                    rr = row + dr
+                    if rr < 0 or rr >= n:
+                        continue
+                    for dc in range(-radius, radius + 1):
+                        cc = col + dc
+                        if cc < 0 or cc >= n:
+                            continue
+                        v = dense[rr][cc]
+                        if not math.isnan(v):
+                            acc += v
+                            cnt += 1
+                if cnt == 0:
+                    continue
+                avg = acc / cnt
+                lat = lat_min + row * lat_step
+                lon = lon_min + col * lon_step
+                smoothed.append([
+                    round(lat, 5),
+                    round(lon, 5),
+                    round(avg, 3),
+                ])
+
+        return smoothed
 
     # ------------------------------------------------------------------
     # Sensor formatter
@@ -1046,9 +1371,7 @@ class StationsTab(QWidget):
         # can ignore the spurious loadFinished(False) that QWebEngine emits
         # when the implicit about:blank navigation is aborted by the new load.
         self._expecting_html_load = False
-        # Path to the temp HTML file currently loaded in the map view.
-        # Kept so the old file can be deleted when a new one is written.
-        self._map_html_tmp: Optional[str] = None
+        self._map_html_tmp: Optional[str] = None  # legacy: no longer used (localhost map document server)
         self.last_refresh_time = None
         self.refresh_timer = None
         self._init_ui()
@@ -1076,6 +1399,7 @@ class StationsTab(QWidget):
         self.map_view = QWebEngineView()
         self.map_view.loadFinished.connect(self._on_map_load_finished)
         layout.addWidget(self.map_view)
+        self._ensure_map_web_profile()
 
         self._load_map()
 
@@ -1083,22 +1407,54 @@ class StationsTab(QWidget):
     # Map loading
     # ------------------------------------------------------------------
 
+    def _ensure_map_web_profile(self) -> None:
+        """Dedicated profile with DB user_agent (OSM tile policy)."""
+        if not WEBENGINE_AVAILABLE or QWebEngineProfile is None or QWebEnginePage is None:
+            return
+        try:
+            row = self.controller.db.get_map_tile_provider_row()
+            ua = str(row["user_agent"])
+        except Exception as e:
+            logger.error("[Map] map_tile_provider unreadable: %s", e)
+            return
+        prof = QWebEngineProfile("WeatherAppMapProfile", self.map_view)
+        prof.setHttpUserAgent(ua)
+        page = QWebEnginePage(prof, self.map_view)
+        self.map_view.setPage(page)
+
     def _load_map(self):
         if not WEBENGINE_AVAILABLE:
             return
 
         warning_detector = WarningDetector(self.controller.db)
-        builder = MapDataBuilder(self.controller.db, warning_detector)
+        debug_mode = bool(self.controller.config.get_setting("debug_mode", False))
+        builder = MapDataBuilder(self.controller.db, warning_detector, debug_mode=debug_mode)
 
         try:
             payload = builder.build()
         except Exception as e:
             logger.error(f"MapDataBuilder.build() failed: {e}")
+            to = self.controller.db.get_calibration_parameter("map_init_size_ready_timeout_ms")
+            try:
+                mt = self.controller.db.get_map_tile_provider_for_payload()
+            except Exception:
+                mt = {}
             payload = {
                 "cities": [], "sensors": [],
                 "cluster_alerts": [], "score_metadata": {},
                 "idw_grid": [], "idw_max": 1.0, "idw_true_max": 1.0,
+                "map_init_timeout_ms": int(to) if to is not None else 0,
+                "heatmap_confidence": {"level": "ok", "reasons": ["payload_build_failed"]},
+                "heatmap_confidence_visual": {},
+                "normalization_readiness": {"unusable_parameters": [], "unstable_count": 0, "unusable_count": 0},
+                "map_tile": mt,
             }
+
+        try:
+            payload["map_tile"] = self.controller.db.get_map_tile_provider_for_payload()
+        except Exception as e:
+            logger.error(f"[Map] map_tile payload failed: {e}")
+            return
 
         cities = payload.get("cities", [])
         n_heat = sum(1 for c in cities if c.get("pm25_24h") is not None)
@@ -1133,32 +1489,21 @@ class StationsTab(QWidget):
             f"/ {len(html):,} B HTML  "
             f"/ {len(html) / 1024 / 1024:.2f} MB total"
         )
-        # setHtml() has a hard 2 MB limit — large payloads (200+ cities) are
-        # silently dropped and loadFinished(True) never fires.
-        # Write to a named temp file and load it via file:// URL instead.
+        # Large HTML: use singleton localhost document server so tile requests
+        # get http Referer (OSM policy); setHtml/file:// are insufficient.
         try:
-            tmp_fd, tmp_path = tempfile.mkstemp(suffix=".html", prefix="weatherapp_map_")
-            with os.fdopen(tmp_fd, "w", encoding="utf-8") as fh:
-                fh.write(html)
-        except OSError as exc:
-            logger.error(f"[Heatmap] failed to write map temp file: {exc}")
+            set_map_document_html(html)
+            map_url = map_document_server_url()
+        except Exception as exc:
+            logger.error(f"[Heatmap] local map document server failed: {exc}", exc_info=True)
             return
 
-        # Delete the previous temp file (best-effort — Windows may refuse if
-        # the web engine still holds a file handle; ignore that error).
-        if self._map_html_tmp and os.path.exists(self._map_html_tmp):
-            try:
-                os.remove(self._map_html_tmp)
-            except OSError:
-                pass
-        self._map_html_tmp = tmp_path
-
-        logger.info(f"[Heatmap] loading map from temp file ({len(html):,} bytes): {tmp_path}")
+        logger.info(f"[Heatmap] loading map from {map_url}")
 
         # Arm the flag BEFORE load() so that the handler is ready for the
         # loadFinished(True) that follows the about:blank abort.
         self._expecting_html_load = True
-        self.map_view.load(QUrl.fromLocalFile(tmp_path))
+        self.map_view.load(QUrl(map_url))
         self.map_view.page().titleChanged.connect(self._on_title_changed)
         self._sensors_loaded = True
 
@@ -1275,9 +1620,9 @@ class StationsTab(QWidget):
 
         QTimer.singleShot(
             0,
-            lambda: self.map_view.page().runJavaScript("initHeatOverlay();")
+            lambda: self.map_view.page().runJavaScript("beginHeatmapAttachWhenSized();"),
         )
-        logger.info("[Heatmap] initHeatOverlay() scheduled (second QTimer hop)")
+        logger.info("[Heatmap] beginHeatmapAttachWhenSized() scheduled (second QTimer hop)")
 
     # ------------------------------------------------------------------
     # HTML / Leaflet generation
@@ -1362,6 +1707,15 @@ class StationsTab(QWidget):
   .inv-bar-fill    {{ height:10px; border-radius:4px; }}
   .meta-note       {{ font-size:10px; color:#888; margin-top:4px; }}
   .low-density-note {{ font-size:11px; color:#e67e22; margin-top:4px; }}
+  #heatmap-confidence-badge {{
+    position: absolute; top: 52px; right: 12px; z-index: 1000;
+    font-size: 11px; padding: 4px 10px; border-radius: 14px;
+    background: rgba(255,255,255,0.92); border: 1px solid #bbb;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.2); max-width: 220px;
+  }}
+  #heatmap-confidence-badge.unreliable {{ border-color: #c0392b; color: #922b21; }}
+  #heatmap-confidence-badge.low {{ border-color: #e67e22; color: #a04000; }}
+  #heatmap-confidence-badge.ok {{ border-color: #27ae60; color: #1e8449; }}
 </style>
 </head>
 <body>
@@ -1378,6 +1732,8 @@ class StationsTab(QWidget):
 </div>
 
 <div id="cluster-banner"></div>
+<div id="heatmap-confidence-banner"></div>
+<div id="heatmap-confidence-badge" style="display:none;"></div>
 <div id="map"></div>
 
 <script>
@@ -1392,12 +1748,57 @@ var solarLayer    = PAYLOAD.solar_layer   || [];
 var stormLayer    = PAYLOAD.storm_layer   || [];
 var lightningLayer = PAYLOAD.lightning_layer || [];
 
+(function() {{
+  var hc = PAYLOAD.heatmap_confidence || {{}};
+  var vis = PAYLOAD.heatmap_confidence_visual || {{}};
+  var el = document.getElementById('heatmap-confidence-banner');
+  if (!el) return;
+  var lvl = hc.level || 'ok';
+  var row = vis[lvl] || {{}};
+  var label = row.badge_label_sv || '';
+  if (hc.level === 'unreliable' || hc.level === 'low') {{
+    var reasons = (hc.reasons || []).join(', ');
+    var bg = hc.level === 'unreliable' ? 'rgba(192,57,43,0.92)' : 'rgba(230,126,34,0.92)';
+    el.innerHTML = '<div style="background:' + bg + ';color:#fff;padding:8px 14px;border-radius:6px;font-size:12px;max-width:520px;margin:0 auto 6px auto;box-shadow:0 2px 6px rgba(0,0,0,0.35);">'
+      + '<strong>' + (label || hc.level) + '</strong>'
+      + (reasons ? (' — ' + reasons) : '')
+      + '</div>';
+    el.style.cssText = 'position:absolute;bottom:78px;left:50%;transform:translateX(-50%);z-index:1000;width:92%;max-width:520px;';
+  }} else {{
+    el.innerHTML = '';
+  }}
+  var bd = document.getElementById('heatmap-confidence-badge');
+  if (bd) {{
+    bd.style.display = 'block';
+    bd.className = '';
+    bd.classList.add(lvl);
+    bd.textContent = label || ('Heatmap: ' + lvl);
+  }}
+}})();
+
+(function() {{
+  var nr = PAYLOAD.normalization_readiness || {{}};
+  var bad = nr.unusable_parameters || [];
+  if (bad.length) {{
+    console.warn('[Heatmap] normalization unusable parameters:', bad.join(', '));
+  }}
+}})();
+
 // ── Map init ─────────────────────────────────────────────────────────────
 var map = L.map('map');
 {map_init_js}
-L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
-  attribution: '© OpenStreetMap contributors'
-}}).addTo(map);
+(function() {{
+  var mt = PAYLOAD.map_tile || {{}};
+  if (!mt.url_template) {{
+    console.error('[Map] PAYLOAD.map_tile.url_template missing — check map_tile_provider in DB');
+  }} else {{
+    var opts = {{ attribution: mt.attribution_html || '' }};
+    if (mt.subdomains) {{ opts.subdomains = mt.subdomains; }}
+    if (typeof mt.min_zoom === 'number') {{ opts.minZoom = mt.min_zoom; }}
+    if (typeof mt.max_zoom === 'number') {{ opts.maxZoom = mt.max_zoom; }}
+    L.tileLayer(mt.url_template, opts).addTo(map);
+  }}
+}})();
 L.control.zoom({{ position: 'topright' }}).addTo(map);
 map.scrollWheelZoom.enable();
 
@@ -1496,7 +1897,9 @@ cities.forEach(function(city) {{
   var sparkline = buildSparkline(city.trend_24h);
   var invGauge  = buildInvGauge(city.inversion_score, scoreMeta);
 
-  var pm25Str  = pm25  != null ? pm25.toFixed(1)  + ' µg/m³' : 'Ingen data';
+  var pm25Str  = pm25 != null
+    ? pm25.toFixed(1) + ' µg/m³' + (city.pm25_source_label ? ' (källa: ' + city.pm25_source_label + ')' : '')
+    : 'Ingen data';
   var tempStr  = city.temperature  != null ? city.temperature.toFixed(1)  + ' °C'    : '–';
   var humStr   = city.humidity     != null ? city.humidity.toFixed(0)     + '%'       : '–';
   var wsStr    = city.wind_speed   != null ? city.wind_speed.toFixed(1)   + ' m/s'   : '–';
@@ -1553,21 +1956,30 @@ window.addEventListener("resize", function() {{
   map.invalidateSize();
 }});
 
-function initHeatOverlay() {{
+var __heatAttachState = {{ done: false, timer: null, ro: null }};
+
+function attachHeatOverlayOnce() {{
+  if (__heatAttachState.done) return;
   map.invalidateSize();
   var size = map.getSize();
-  if (size.x === 0 || size.y === 0) {{
-    // Qt layout has not yet assigned pixel dimensions — retry on next paint frame
-    requestAnimationFrame(initHeatOverlay);
-    return;
-  }}
 
   var grid = PAYLOAD.idw_grid;
   var meta = PAYLOAD.idw_meta;
   if (!grid || !grid.length || !meta) {{
     console.error("[Heatmap] idw_grid or idw_meta missing — overlay skipped");
+    __heatAttachState.done = true;
     return;
   }}
+
+  var baseHeatOpacity = {opacity_float};
+  var hcLvl = (PAYLOAD.heatmap_confidence || {{}}).level || 'ok';
+  var visRow = (PAYLOAD.heatmap_confidence_visual || {{}})[hcLvl] || {{}};
+  var opacityMult = (typeof visRow.opacity_multiplier === 'number') ? visRow.opacity_multiplier : null;
+  if (opacityMult === null) {{
+    console.error("[Heatmap] heatmap_confidence_visual missing opacity_multiplier for level", hcLvl);
+    opacityMult = 1.0;
+  }}
+  var heatOpacityEffective = Math.max(0, Math.min(1, baseHeatOpacity * opacityMult));
 
   // ── AQI colour gradient stops (same palette as before) ──────────────────
   var stops = [
@@ -1577,14 +1989,16 @@ function initHeatOverlay() {{
     {{ t:0.75, r:255, g:0,   b:0   }},
     {{ t:1.0,  r:126, g:0,   b:35  }}
   ];
-  // Use percentile-based scaling (p5-p95) instead of just max
-  var pm25_p5 = PAYLOAD.pm25_p5;
-  var pm25_p95 = PAYLOAD.pm25_p95 || heatMax;
-  var pm25_scale_range = (pm25_p95 - pm25_p5) || 1.0;
+
+  // DB-driven value domain / clipping for colour mapping
+  var hcfg = PAYLOAD.heatmap_config || {{}};
+  var clipMin = (typeof hcfg.clip_min === 'number') ? hcfg.clip_min : 0.0;
+  var clipMax = (typeof hcfg.clip_max === 'number') ? hcfg.clip_max : heatMax;
+  if (clipMax <= clipMin) clipMax = clipMin + 1.0;
   
   function valToRGB(val) {{
-    // Normalize using percentile bounds (p5-p95)
-    var t = Math.max(0, Math.min(1, (val - pm25_p5) / pm25_scale_range));
+    // Normalize using DB-driven clip bounds
+    var t = Math.max(0, Math.min(1, (val - clipMin) / (clipMax - clipMin)));
     for (var i = 1; i < stops.length; i++) {{
       if (t <= stops[i].t) {{
         var s0 = stops[i-1], s1 = stops[i];
@@ -1606,7 +2020,7 @@ function initHeatOverlay() {{
   raw.height = n;
   var ctx = raw.getContext('2d');
   var img = ctx.createImageData(n, n);
-  var alpha = Math.round({opacity_float} * 255);
+  var alpha = Math.round(heatOpacityEffective * 255);
 
   for (var k = 0; k < grid.length; k++) {{
     var pt  = grid[k];
@@ -1639,13 +2053,60 @@ function initHeatOverlay() {{
 
   var dataURL = big.toDataURL('image/png');
   var bounds  = [[meta.lat_min, meta.lon_min], [meta.lat_max, meta.lon_max]];
-  heatLayer   = L.imageOverlay(dataURL, bounds, {{ opacity: {opacity_float}, interactive: false }});
+  heatLayer   = L.imageOverlay(dataURL, bounds, {{ opacity: heatOpacityEffective, interactive: false }});
   heatLayer.addTo(map);
+  __heatAttachState.done = true;
   console.log("[Heatmap] imageOverlay created. size:", size.x, "x", size.y,
-              "canvas:", big.width, "x", big.height, "heatMax:", heatMax);
+              "canvas:", big.width, "x", big.height, "heatMax:", heatMax,
+              "opacityEffective:", heatOpacityEffective);
 }}
-// initHeatOverlay() is called from Python via runJavaScript after
-// loadFinished fires — Python drives timing, not a JS self-timer.
+
+function beginHeatmapAttachWhenSized() {{
+  var timeoutMs = PAYLOAD.map_init_timeout_ms;
+  if (typeof timeoutMs !== 'number' || timeoutMs <= 0 || !isFinite(timeoutMs)) {{
+    console.error("[Heatmap] map_init_timeout_ms missing or invalid — check calibration_parameters (map_init_size_ready_timeout_ms)");
+    return;
+  }}
+  var mapDiv = map.getContainer();
+
+  function tryAttach() {{
+    map.invalidateSize();
+    var s = map.getSize();
+    if (s.x > 0 && s.y > 0) {{
+      if (__heatAttachState.timer) clearTimeout(__heatAttachState.timer);
+      if (__heatAttachState.ro) {{
+        __heatAttachState.ro.disconnect();
+        __heatAttachState.ro = null;
+      }}
+      attachHeatOverlayOnce();
+      return true;
+    }}
+    return false;
+  }}
+
+  if (tryAttach()) return;
+
+  if (typeof ResizeObserver !== "undefined") {{
+    __heatAttachState.ro = new ResizeObserver(function() {{ tryAttach(); }});
+    __heatAttachState.ro.observe(mapDiv);
+  }} else {{
+    console.error("[Heatmap] ResizeObserver unavailable — cannot satisfy size-ready contract");
+  }}
+
+  __heatAttachState.timer = setTimeout(function() {{
+    if (__heatAttachState.done) return;
+    var s = map.getSize();
+    console.error("[Heatmap] MAP_INIT_TIMEOUT: map container size remained " + s.x + "x" + s.y +
+      " after " + timeoutMs + "ms (DB map_init_size_ready_timeout_ms) — heat overlay not attached");
+    if (__heatAttachState.ro) {{
+      __heatAttachState.ro.disconnect();
+      __heatAttachState.ro = null;
+    }}
+  }}, timeoutMs);
+}}
+
+function initHeatOverlay() {{ beginHeatmapAttachWhenSized(); }}
+// beginHeatmapAttachWhenSized() is invoked from Python via runJavaScript after loadFinished(True).
 
 // ── Sensor marker layer ───────────────────────────────────────────────────
 sensors.forEach(function(s) {{
@@ -1891,6 +2352,16 @@ setTimeout(function() {{
   initSolarLayer();
   initStormLayer();
 }}, 1000);
+
+// Placeholder for future DB-driven PM2.5 contour overlay (no-op for now).
+// The enable flag and levels are already DB-driven via PAYLOAD.heatmap_config.
+function initPm25Contours() {{
+  var hcfg = PAYLOAD.heatmap_config || {{}};
+  if (!hcfg.contours_enabled) return;
+  var levels = hcfg.contours_levels || [];
+  if (!levels.length) return;
+  // Contour computation and rendering will be added in a future iteration.
+}}
 
 // ── Layer toggle logic ────────────────────────────────────────────────────
 function toggleLayer(name) {{

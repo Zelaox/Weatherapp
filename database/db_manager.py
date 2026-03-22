@@ -1,17 +1,47 @@
 """Database manager for SQLite operations."""
 
+import json
 import sqlite3
 import os
 import threading
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from typing import List, Dict, Optional, Tuple, Any
+from typing import List, Dict, Optional, Tuple, Any, Union, Set
 from pathlib import Path
 import logging
 import re
 
+from utils.geo import haversine_km
+from utils.backfill_support_validation import (
+    default_backfill_support_json,
+    validate_backfill_support,
+)
+from utils.heatmap_json_validation import (
+    validate_global_score_clip,
+    validate_method_selection_rules,
+    validate_spatial_index_rules,
+)
+
 # CET timezone for all operations
 CET = ZoneInfo("Europe/Stockholm")
+
+# Optional columns on weather_data (beyond core + solar/storm + standard pollutants).
+# Used for INSERT and migration; must match Open-Meteo/parameter_registry names.
+WEATHER_DATA_EXTENDED_OPTIONAL_COLUMNS: Tuple[str, ...] = (
+    "wind_direction",
+    "pressure",
+    "precipitation",
+    "cloud_cover",
+    "visibility",
+    "dew_point",
+    "feels_like",
+    "heat_index",
+    "wind_chill",
+    "co",
+    "so2",
+    "nh3",
+    "bc",
+)
 
 # Get module logger
 logger = logging.getLogger("WeatherApp.database")
@@ -35,6 +65,8 @@ class DatabaseManager:
         """
         logger.info(f"Initializing DatabaseManager with path: {db_path}")
         self.db_path = db_path
+        self._parameter_registry_revision: int = 0
+        self._cape_segments_cache: Optional[List[Dict[str, Any]]] = None
         try:
             self._init_database()
             logger.info("DatabaseManager initialized successfully")
@@ -110,6 +142,14 @@ class DatabaseManager:
         Use this instead of accessing _get_connection() directly.
         """
         return self._get_connection()
+
+    def bump_parameter_registry_revision(self) -> None:
+        """Invalidate consumers that cache parameter_registry-derived metadata."""
+        self._parameter_registry_revision += 1
+
+    @property
+    def parameter_registry_revision(self) -> int:
+        return self._parameter_registry_revision
 
     # --- OpenAQ location cache & API usage helpers ---
 
@@ -376,6 +416,13 @@ class DatabaseManager:
                 else:
                     logger.warning(f"Migration file not found: {migration_path}")
             
+            cursor.execute("PRAGMA table_info(weather_data)")
+            columns = [row[1] for row in cursor.fetchall()]
+            if "cloud_cover" not in columns:
+                self._migrate_extended_weather_columns_if_needed(conn)
+                cursor.execute("PRAGMA table_info(weather_data)")
+                columns = [row[1] for row in cursor.fetchall()]
+            
             # Check if sensors table exists
             if not self.has_sensors_table():
                 logger.info("Running migration to add sensors table...")
@@ -459,7 +506,20 @@ class DatabaseManager:
                         logger.info("Migration klar: sensor engine schema uppdaterat")
                     else:
                         logger.warning(f"Migration file not found: {migration_path}")
-            
+
+            # parameter_registry base table (source of truth for parameters; must exist before chart/provider migrations)
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='parameter_registry'")
+            if cursor.fetchone() is None:
+                logger.info("Kör migration för parameter_registry bas-tabell...")
+                migration_path = Path(__file__).parent / "migration_add_parameter_registry.sql"
+                if migration_path.exists():
+                    with open(migration_path, "r", encoding="utf-8") as f:
+                        conn.executescript(f.read())
+                    conn.commit()
+                    logger.info("Migration klar: parameter_registry tabell skapad")
+                else:
+                    logger.warning(f"Migration file not found: {migration_path}")
+
             # Check if calibration_parameters table exists and has required parameters
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='calibration_parameters'")
             has_calibration_table = cursor.fetchone() is not None
@@ -530,43 +590,7 @@ class DatabaseManager:
                         conn.executescript(migration_sql)
                         conn.commit()
                         logger.info("Migration klar: CAPE scaling parameters tillagda")
-                
-                # Check if chart variation system exists
-                cursor.execute("PRAGMA table_info(parameter_registry)")
-                param_registry_cols = [row[1] for row in cursor.fetchall()]
-                if 'variation_mode' not in param_registry_cols:
-                    logger.info("Kör migration för chart variation system...")
-                    migration_path = Path(__file__).parent / "migration_add_chart_variation_system.sql"
-                    if migration_path.exists():
-                        with open(migration_path, 'r', encoding='utf-8') as f:
-                            migration_sql = f.read()
-                        conn.executescript(migration_sql)
-                        conn.commit()
-                        logger.info("Migration klar: chart variation system tillagt")
-                
-                # Check if provider_mappings column exists in parameter_registry
-                if 'provider_mappings' not in param_registry_cols:
-                    logger.info("Kör migration för parameter provider metadata...")
-                    try:
-                        # Add provider_mappings column
-                        cursor.execute("ALTER TABLE parameter_registry ADD COLUMN provider_mappings TEXT")
-                        conn.commit()
-                        logger.info("Migration klar: provider_mappings kolumn tillagd i parameter_registry")
-                    except sqlite3.OperationalError as e:
-                        if "duplicate column name" not in str(e).lower():
-                            logger.warning(f"Kunde inte lägga till provider_mappings kolumn: {e}")
-                    
-                    # Run migration SQL to populate mappings
-                    migration_path = Path(__file__).parent / "migration_add_parameter_metadata.sql"
-                    if migration_path.exists():
-                        with open(migration_path, 'r', encoding='utf-8') as f:
-                            migration_sql = f.read()
-                        conn.executescript(migration_sql)
-                        conn.commit()
-                        logger.info("Migration klar: parameter provider mappings tillagda")
-                    else:
-                        logger.warning(f"Migration file not found: {migration_path}")
-                
+
                 # Check if chart_category_styles table exists
                 cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='chart_category_styles'")
                 if cursor.fetchone() is None:
@@ -663,6 +687,28 @@ class DatabaseManager:
                         conn.commit()
                         logger.info("Migration klar: graph_show_legend tillagd")
                 
+                # Heatmap calibration (IDW, smoothing, value domain, contours)
+                cursor.execute("SELECT key FROM calibration_parameters WHERE key = 'heatmap_idw_power'")
+                if cursor.fetchone() is None:
+                    migration_path = Path(__file__).parent / "migration_add_heatmap_calibration.sql"
+                    if migration_path.exists():
+                        with open(migration_path, 'r', encoding='utf-8') as f:
+                            migration_sql = f.read()
+                        conn.executescript(migration_sql)
+                        conn.commit()
+                        logger.info("Migration klar: heatmap calibration parameters tillagda")
+
+                # Nearest-station spatial fallback calibration
+                cursor.execute("SELECT key FROM calibration_parameters WHERE key = 'nearest_station_max_radius_km'")
+                if cursor.fetchone() is None:
+                    migration_path = Path(__file__).parent / "migration_add_nearest_station_calibration.sql"
+                    if migration_path.exists():
+                        with open(migration_path, 'r', encoding='utf-8') as f:
+                            migration_sql = f.read()
+                        conn.executescript(migration_sql)
+                        conn.commit()
+                        logger.info("Migration klar: nearest-station calibration parameters tillagda")
+
                 # Remove icon system (SVG icons removed from application)
                 cursor.execute("PRAGMA table_info(chart_category_styles)")
                 columns = [col[1] for col in cursor.fetchall()]
@@ -685,12 +731,269 @@ class DatabaseManager:
                         logger.info("Migration klar: icon system borttaget")
                     else:
                         logger.warning(f"Migration file not found: {migration_path}")
-            
-            # After migrations, run auto-discovery and auto-generation
-            logger.info("Kör parameter registry auto-discovery och normalization bounds auto-generering...")
+
+            # parameter_registry: chart variation, provider_mappings, metadata v2 (all code paths)
+            cursor.execute("PRAGMA table_info(parameter_registry)")
+            param_registry_cols = [row[1] for row in cursor.fetchall()]
+            if param_registry_cols and "variation_mode" not in param_registry_cols:
+                logger.info("Kör migration för chart variation system...")
+                migration_path = Path(__file__).parent / "migration_add_chart_variation_system.sql"
+                if migration_path.exists():
+                    with open(migration_path, "r", encoding="utf-8") as f:
+                        migration_sql = f.read()
+                    conn.executescript(migration_sql)
+                    conn.commit()
+                    logger.info("Migration klar: chart variation system tillagt")
+
+            cursor.execute("PRAGMA table_info(parameter_registry)")
+            param_registry_cols = [row[1] for row in cursor.fetchall()]
+            if param_registry_cols and "provider_mappings" not in param_registry_cols:
+                logger.info("Kör migration för parameter provider metadata...")
+                try:
+                    cursor.execute("ALTER TABLE parameter_registry ADD COLUMN provider_mappings TEXT")
+                    conn.commit()
+                    logger.info("Migration klar: provider_mappings kolumn tillagd i parameter_registry")
+                except sqlite3.OperationalError as e:
+                    if "duplicate column name" not in str(e).lower():
+                        logger.warning(f"Kunde inte lägga till provider_mappings kolumn: {e}")
+                migration_path = Path(__file__).parent / "migration_add_parameter_metadata.sql"
+                if migration_path.exists():
+                    with open(migration_path, "r", encoding="utf-8") as f:
+                        migration_sql = f.read()
+                    conn.executescript(migration_sql)
+                    conn.commit()
+                    logger.info("Migration klar: parameter provider mappings tillagda")
+                else:
+                    logger.warning(f"Migration file not found: {migration_path}")
+
+            cursor.execute("PRAGMA table_info(parameter_registry)")
+            param_registry_cols = [row[1] for row in cursor.fetchall()]
+            cursor.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='variable_family'"
+            )
+            needs_family_tables = cursor.fetchone() is None
+            needs_meta_cols = (
+                param_registry_cols
+                and any(
+                    c not in param_registry_cols
+                    for c in ("source", "backfill_support", "variable_family_key")
+                )
+            )
+            if param_registry_cols and (needs_meta_cols or needs_family_tables):
+                logger.info(
+                    "Kör migration för parameter_registry metadata v2 (source, backfill_support, variable_family)..."
+                )
+                try:
+                    cursor.execute("ALTER TABLE parameter_registry ADD COLUMN source TEXT")
+                    conn.commit()
+                except sqlite3.OperationalError as e:
+                    if "duplicate column name" not in str(e).lower():
+                        logger.warning(f"Kunde inte lägga till source: {e}")
+                cursor.execute("PRAGMA table_info(parameter_registry)")
+                param_registry_cols = [row[1] for row in cursor.fetchall()]
+                try:
+                    if "backfill_support" not in param_registry_cols:
+                        cursor.execute("ALTER TABLE parameter_registry ADD COLUMN backfill_support TEXT")
+                        conn.commit()
+                except sqlite3.OperationalError as e:
+                    if "duplicate column name" not in str(e).lower():
+                        logger.warning(f"Kunde inte lägga till backfill_support: {e}")
+                cursor.execute("PRAGMA table_info(parameter_registry)")
+                param_registry_cols = [row[1] for row in cursor.fetchall()]
+                try:
+                    if "variable_family_key" not in param_registry_cols:
+                        cursor.execute(
+                            "ALTER TABLE parameter_registry ADD COLUMN variable_family_key TEXT"
+                        )
+                        conn.commit()
+                except sqlite3.OperationalError as e:
+                    if "duplicate column name" not in str(e).lower():
+                        logger.warning(f"Kunde inte lägga till variable_family_key: {e}")
+                migration_path = Path(__file__).parent / "migration_add_parameter_registry_metadata_v2.sql"
+                if migration_path.exists():
+                    with open(migration_path, "r", encoding="utf-8") as f:
+                        migration_sql = f.read()
+                    conn.executescript(migration_sql)
+                    conn.commit()
+                    logger.info("Migration klar: variable_family + variable_family_member")
+                else:
+                    logger.warning(f"Migration file not found: {migration_path}")
+                try:
+                    cursor.execute(
+                        """
+                        UPDATE parameter_registry
+                        SET backfill_support = ?
+                        WHERE backfill_support IS NULL OR TRIM(backfill_support) = ''
+                        """,
+                        (default_backfill_support_json(),),
+                    )
+                    cursor.execute(
+                        """
+                        UPDATE parameter_registry SET variable_family_key = 'storm_cape'
+                        WHERE parameter_name = 'cape' AND (variable_family_key IS NULL OR variable_family_key = '')
+                        """
+                    )
+                    cursor.execute(
+                        """
+                        UPDATE parameter_registry SET variable_family_key = 'storm_precipitation_probability'
+                        WHERE parameter_name = 'precipitation_probability'
+                          AND (variable_family_key IS NULL OR variable_family_key = '')
+                        """
+                    )
+                    cursor.execute(
+                        """
+                        UPDATE parameter_registry SET variable_family_key = 'storm_convective_precipitation'
+                        WHERE parameter_name = 'convective_precipitation'
+                          AND (variable_family_key IS NULL OR variable_family_key = '')
+                        """
+                    )
+                    conn.commit()
+                except Exception as e:
+                    logger.warning(f"Kunde inte seeda backfill_support / variable_family_key: {e}")
+                self.bump_parameter_registry_revision()
+
+            # Math layer: normalization_profile, CAPE piecewise, composite_index_definition, heatmap confidence
+            try:
+                cursor.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='normalization_profile'"
+                )
+                if cursor.fetchone() is None:
+                    logger.info("Kör migration för normalization_profile...")
+                    migration_path = Path(__file__).parent / "migration_add_normalization_profile.sql"
+                    if migration_path.exists():
+                        with open(migration_path, "r", encoding="utf-8") as f:
+                            conn.executescript(f.read())
+                        conn.commit()
+                        logger.info("Migration klar: normalization_profile")
+                    else:
+                        logger.warning(f"Migration file not found: {migration_path}")
+
+                cursor.execute("PRAGMA table_info(parameter_registry)")
+                pr_cols = [row[1] for row in cursor.fetchall()]
+                if pr_cols and "normalization_profile_id" not in pr_cols:
+                    try:
+                        cursor.execute(
+                            "ALTER TABLE parameter_registry ADD COLUMN normalization_profile_id INTEGER"
+                        )
+                        conn.commit()
+                        logger.info("normalization_profile_id kolumn tillagd på parameter_registry")
+                    except sqlite3.OperationalError as e:
+                        if "duplicate column name" not in str(e).lower():
+                            logger.warning(f"Kunde inte lägga till normalization_profile_id: {e}")
+
+                cursor.execute(
+                    "UPDATE parameter_registry SET normalization_profile_id = 1 "
+                    "WHERE normalization_profile_id IS NULL"
+                )
+                conn.commit()
+
+                cursor.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='cape_piecewise_segment'"
+                )
+                if cursor.fetchone() is None:
+                    migration_path = Path(__file__).parent / "migration_add_cape_piecewise.sql"
+                    if migration_path.exists():
+                        with open(migration_path, "r", encoding="utf-8") as f:
+                            conn.executescript(f.read())
+                        conn.commit()
+                        logger.info("Migration klar: cape_piecewise_segment")
+
+                cursor.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='composite_index_definition'"
+                )
+                if cursor.fetchone() is None:
+                    migration_path = Path(__file__).parent / "migration_add_composite_index_definition.sql"
+                    if migration_path.exists():
+                        with open(migration_path, "r", encoding="utf-8") as f:
+                            conn.executescript(f.read())
+                        conn.commit()
+                        logger.info("Migration klar: composite_index_definition")
+
+                cursor.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='calibration_parameters'"
+                )
+                if cursor.fetchone() is not None:
+                    cursor.execute(
+                        "SELECT key FROM calibration_parameters WHERE key = 'heatmap_confidence_low_min_stations'"
+                    )
+                    if cursor.fetchone() is None:
+                        migration_path = (
+                            Path(__file__).parent / "migration_add_heatmap_confidence_calibration.sql"
+                        )
+                        if migration_path.exists():
+                            with open(migration_path, "r", encoding="utf-8") as f:
+                                conn.executescript(f.read())
+                            conn.commit()
+                            logger.info("Migration klar: heatmap confidence calibration")
+
+                    cursor.execute(
+                        "SELECT key FROM calibration_parameters WHERE key = 'map_init_size_ready_timeout_ms'"
+                    )
+                    if cursor.fetchone() is None:
+                        mq = Path(__file__).parent / "migration_map_init_and_data_quality.sql"
+                        if mq.exists():
+                            with open(mq, "r", encoding="utf-8") as f:
+                                conn.executescript(f.read())
+                            conn.commit()
+                            logger.info("Migration klar: map init + data quality (calibration, profiles, visual mapping)")
+
+                    cursor.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table' AND name='heatmap_interpolation_config'"
+                    )
+                    if cursor.fetchone() is None:
+                        mhi = Path(__file__).parent / "migration_add_heatmap_interpolation_engine.sql"
+                        if mhi.exists():
+                            with open(mhi, "r", encoding="utf-8") as f:
+                                conn.executescript(f.read())
+                            conn.commit()
+                            logger.info("Migration klar: heatmap interpolation engine + confidence tables")
+
+            except Exception as e:
+                logger.warning(f"Math layer migration block: {e}")
+
+            # Map tile provider (independent of calibration_parameters presence)
+            try:
+                cursor.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='map_tile_provider'"
+                )
+                if cursor.fetchone() is None:
+                    mtp = Path(__file__).parent / "migration_map_tile_provider.sql"
+                    if mtp.exists():
+                        with open(mtp, "r", encoding="utf-8") as f:
+                            conn.executescript(f.read())
+                        conn.commit()
+                        logger.info("Migration klar: map_tile_provider")
+                self.validate_map_tile_contract()
+            except Exception as e:
+                logger.error("map_tile_provider migration/validation failed: %s", e, exc_info=True)
+                raise
+
+            try:
+                self.validate_heatmap_engine_config()
+                self.cleanup_heatmap_render_debug()
+            except Exception as e:
+                logger.error("heatmap engine validation/cleanup failed: %s", e, exc_info=True)
+                raise
+
+            # After migrations, run REPAIR MODE discovery and auto-generation
+            logger.info("Kör parameter registry REPAIR MODE discovery och normalization bounds auto-generering...")
             try:
                 self._auto_discover_parameters_from_schema(conn)
+                try:
+                    cursor.execute(
+                        "UPDATE parameter_registry SET normalization_profile_id = 1 "
+                        "WHERE normalization_profile_id IS NULL"
+                    )
+                    conn.commit()
+                except Exception:
+                    pass
                 self._auto_generate_all_normalization_bounds(conn)
+                sync = self.validate_registry_schema_sync()
+                if not sync.get("ok"):
+                    logger.warning(
+                        "validate_registry_schema_sync: registry/schema drift — %s",
+                        sync,
+                    )
             except Exception as e:
                 logger.warning(f"Fel vid auto-discovery/auto-generation: {e}")
         except Exception as e:
@@ -941,6 +1244,70 @@ class DatabaseManager:
             "expected_range": "3-8 m/s for Sweden (normal), up to 20 m/s during storms",
         }
     
+    def _migrate_extended_weather_columns_if_needed(self, conn: sqlite3.Connection) -> None:
+        """Add nullable REAL columns for extended weather/air parameters; merge Open-Meteo mappings."""
+        logger.info("Migration: extended weather_data columns (dew_point, cloud_cover, pollutants, ...)")
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA table_info(weather_data)")
+        existing = {row[1] for row in cursor.fetchall()}
+        for col_name in WEATHER_DATA_EXTENDED_OPTIONAL_COLUMNS:
+            if col_name not in existing:
+                try:
+                    cursor.execute(
+                        f"ALTER TABLE weather_data ADD COLUMN {col_name} REAL"
+                    )
+                    logger.info(f"weather_data: added column {col_name}")
+                except sqlite3.OperationalError as e:
+                    if "duplicate column name" not in str(e).lower():
+                        raise
+        conn.commit()
+        self._apply_extended_parameter_registry_openmeteo_mappings(cursor)
+        conn.commit()
+        self.bump_parameter_registry_revision()
+
+    def _apply_extended_parameter_registry_openmeteo_mappings(self, cursor: sqlite3.Cursor) -> None:
+        """Merge Open-Meteo API field names into provider_mappings JSON (non-destructive for other keys)."""
+        merge: Dict[str, str] = {
+            "pm25": "pm2_5",
+            "pm10": "pm10",
+            "no2": "nitrogen_dioxide",
+            "o3": "ozone",
+            "dew_point": "dew_point_2m",
+            "feels_like": "apparent_temperature",
+            "cloud_cover": "cloud_cover",
+            "pressure": "pressure_msl",
+            "precipitation": "precipitation",
+            "wind_direction": "wind_direction_10m",
+            "visibility": "visibility",
+            "co": "carbon_monoxide",
+            "so2": "sulphur_dioxide",
+            "nh3": "ammonia",
+            # bc: Open-Meteo field name varies by model — set provider_mappings.openmeteo manually when known
+        }
+        for pname, om_field in merge.items():
+            cursor.execute(
+                "SELECT provider_mappings FROM parameter_registry WHERE parameter_name = ?",
+                (pname,),
+            )
+            row = cursor.fetchone()
+            if not row:
+                continue
+            raw = row[0]
+            try:
+                d = json.loads(raw) if raw else {}
+            except (json.JSONDecodeError, TypeError):
+                d = {}
+            if not isinstance(d, dict):
+                d = {}
+            if d.get("openmeteo") == om_field:
+                continue
+            d["openmeteo"] = om_field
+            cursor.execute(
+                "UPDATE parameter_registry SET provider_mappings = ? WHERE parameter_name = ?",
+                (json.dumps(d), pname),
+            )
+            logger.debug(f"parameter_registry: merged openmeteo mapping {pname} -> {om_field}")
+
     def add_weather_data(
         self,
         city_id: int,
@@ -965,6 +1332,20 @@ class DatabaseManager:
         cape: Optional[float] = None,
         precipitation_probability: Optional[float] = None,
         convective_precipitation: Optional[float] = None,
+        # Extended weather / air (nullable columns; same names as parameter_registry / Open-Meteo)
+        wind_direction: Optional[float] = None,
+        pressure: Optional[float] = None,
+        precipitation: Optional[float] = None,
+        cloud_cover: Optional[float] = None,
+        visibility: Optional[float] = None,
+        dew_point: Optional[float] = None,
+        feels_like: Optional[float] = None,
+        heat_index: Optional[float] = None,
+        wind_chill: Optional[float] = None,
+        co: Optional[float] = None,
+        so2: Optional[float] = None,
+        nh3: Optional[float] = None,
+        bc: Optional[float] = None,
         # Performance optimization flags
         skip_auto_bounds: bool = False  # Skip auto-generation of normalization bounds (for bulk inserts)
     ) -> int:
@@ -1056,11 +1437,46 @@ class DatabaseManager:
                     """INSERT INTO weather_data 
                        (city_id, temperature, humidity, wind_speed, pm25, pm10, no2, o3, aqi, timestamp, source,
                         uv_index, solar_radiation, direct_radiation, diffuse_radiation, sunshine_duration,
-                        cape, precipitation_probability, convective_precipitation, measurement_timestamp)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (city_id, temperature, humidity, wind_speed, pm25, pm10, no2, o3, aqi, ts, source,
-                     uv_index, solar_radiation, direct_radiation, diffuse_radiation, sunshine_duration,
-                     cape, precipitation_probability, convective_precipitation, meas_ts)
+                        cape, precipitation_probability, convective_precipitation, measurement_timestamp,
+                        wind_direction, pressure, precipitation, cloud_cover, visibility,
+                        dew_point, feels_like, heat_index, wind_chill, co, so2, nh3, bc)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                               ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        city_id,
+                        temperature,
+                        humidity,
+                        wind_speed,
+                        pm25,
+                        pm10,
+                        no2,
+                        o3,
+                        aqi,
+                        ts,
+                        source,
+                        uv_index,
+                        solar_radiation,
+                        direct_radiation,
+                        diffuse_radiation,
+                        sunshine_duration,
+                        cape,
+                        precipitation_probability,
+                        convective_precipitation,
+                        meas_ts,
+                        wind_direction,
+                        pressure,
+                        precipitation,
+                        cloud_cover,
+                        visibility,
+                        dew_point,
+                        feels_like,
+                        heat_index,
+                        wind_chill,
+                        co,
+                        so2,
+                        nh3,
+                        bc,
+                    ),
                 )
                 conn.commit()
                 data_id = cursor.lastrowid
@@ -1093,6 +1509,23 @@ class DatabaseManager:
                         parameters_to_check.append('no2')
                     if o3 is not None:
                         parameters_to_check.append('o3')
+                    for _name, _val in (
+                        ("wind_direction", wind_direction),
+                        ("pressure", pressure),
+                        ("precipitation", precipitation),
+                        ("cloud_cover", cloud_cover),
+                        ("visibility", visibility),
+                        ("dew_point", dew_point),
+                        ("feels_like", feels_like),
+                        ("heat_index", heat_index),
+                        ("wind_chill", wind_chill),
+                        ("co", co),
+                        ("so2", so2),
+                        ("nh3", nh3),
+                        ("bc", bc),
+                    ):
+                        if _val is not None:
+                            parameters_to_check.append(_name)
                     
                     # Try to auto-generate bounds for each parameter
                     for param in parameters_to_check:
@@ -1169,7 +1602,15 @@ class DatabaseManager:
                     else:
                         ts = datetime.now(CET)
                     
-                    # Build row tuple (match INSERT statement order)
+                    meas_ts_b = None
+                    if data.get("measurement_timestamp") is not None:
+                        meas_ts_b = data["measurement_timestamp"]
+                        if meas_ts_b.tzinfo is None:
+                            meas_ts_b = meas_ts_b.replace(tzinfo=CET)
+                        elif meas_ts_b.tzinfo != CET:
+                            meas_ts_b = meas_ts_b.astimezone(CET)
+                    
+                    # Build row tuple (match add_weather_data INSERT order)
                     row = (
                         city_id,
                         float(temperature),
@@ -1189,8 +1630,11 @@ class DatabaseManager:
                         data.get('sunshine_duration'),
                         data.get('cape'),
                         data.get('precipitation_probability'),
-                        data.get('convective_precipitation')
+                        data.get('convective_precipitation'),
+                        meas_ts_b,
                     )
+                    for ext in WEATHER_DATA_EXTENDED_OPTIONAL_COLUMNS:
+                        row = row + (data.get(ext),)
                     rows_to_insert.append(row)
                 
                 if not rows_to_insert:
@@ -1201,12 +1645,15 @@ class DatabaseManager:
                 cursor.execute("BEGIN TRANSACTION")
                 try:
                     # Use executemany() for maximum performance
+                    ext_cols = ", ".join(WEATHER_DATA_EXTENDED_OPTIONAL_COLUMNS)
+                    qmarks = ", ".join(["?"] * (20 + len(WEATHER_DATA_EXTENDED_OPTIONAL_COLUMNS)))
                     cursor.executemany(
-                        """INSERT INTO weather_data 
+                        f"""INSERT INTO weather_data 
                            (city_id, temperature, humidity, wind_speed, pm25, pm10, no2, o3, aqi, timestamp, source,
                             uv_index, solar_radiation, direct_radiation, diffuse_radiation, sunshine_duration,
-                            cape, precipitation_probability, convective_precipitation)
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            cape, precipitation_probability, convective_precipitation, measurement_timestamp,
+                            {ext_cols})
+                           VALUES ({qmarks})""",
                         rows_to_insert
                     )
                     conn.commit()
@@ -1317,7 +1764,105 @@ class DatabaseManager:
         except Exception as e:
             logger.error(f"Fel vid beräkning av {hours}h medelvärde för {parameter}: {e}")
             return None
-    
+
+    def get_stations_with_parameter(self, parameter: str, hours: int = 24) -> List[Dict]:
+        """
+        Get cities that have non-null values for a parameter in the last hours (stations for nearest-station fallback).
+        Dynamic: parameter must exist in weather_data schema; no hardcoded parameter list.
+
+        Returns:
+            List of dicts: city_id, city_name, latitude, longitude, value (rolling avg for parameter).
+        """
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA table_info(weather_data)")
+            columns = [row[1] for row in cursor.fetchall()]
+            if parameter not in columns:
+                logger.debug(f"Parameter '{parameter}' not found in weather_data schema")
+                return []
+            cursor.execute(
+                f"""SELECT c.id AS city_id, c.name AS city_name, c.latitude, c.longitude,
+                           AVG(wd.{parameter}) AS value
+                    FROM cities c
+                    INNER JOIN weather_data wd ON wd.city_id = c.id
+                    WHERE wd.{parameter} IS NOT NULL
+                      AND wd.timestamp >= datetime('now', '-' || ? || ' hours')
+                    GROUP BY c.id, c.name, c.latitude, c.longitude""",
+                (hours,),
+            )
+            return [dict(row) for row in cursor.fetchall()]
+        except Exception as e:
+            logger.warning(f"Fel vid get_stations_with_parameter för {parameter}: {e}")
+            return []
+
+    def get_parameter_for_city_or_nearest(
+        self,
+        city_id: int,
+        parameter: str,
+        hours: int = 24,
+    ) -> Tuple[Optional[float], Optional[int], Optional[str], Optional[float]]:
+        """
+        Get parameter value for a city: own rolling average if available, else nearest station within max radius.
+        All driven by calibration_parameters and schema; no hardcoded lists.
+
+        Returns:
+            (value, source_city_id, source_city_name, distance_km).
+            If own data: source_city_id=city_id, distance_km=0.
+            If no data and no station in radius: (None, None, None, None).
+        """
+        try:
+            own = self.get_rolling_average(city_id, parameter, hours=hours)
+            city = self.get_city(city_id)
+            if not city:
+                return (None, None, None, None)
+            if own is not None:
+                return (own, city_id, city.get("name"), 0.0)
+            max_radius = self.get_calibration_parameter("nearest_station_max_radius_km")
+            if max_radius is None or max_radius <= 0:
+                return (None, None, None, None)
+            max_radius = float(max_radius)
+            use_weighted = self.get_calibration_parameter("nearest_station_use_weighted_avg")
+            use_weighted = use_weighted is not None and float(use_weighted) != 0
+            stations = self.get_stations_with_parameter(parameter, hours=hours)
+            if not stations:
+                return (None, None, None, None)
+            lat = float(city["latitude"])
+            lon = float(city["longitude"])
+            in_radius = []
+            for s in stations:
+                if s["city_id"] == city_id:
+                    continue
+                slat = float(s["latitude"])
+                slon = float(s["longitude"])
+                dist = haversine_km(lat, lon, slat, slon)
+                if dist <= max_radius and s.get("value") is not None:
+                    in_radius.append((dist, s))
+            if not in_radius:
+                return (None, None, None, None)
+            in_radius.sort(key=lambda x: x[0])
+            if use_weighted:
+                total_w = 0.0
+                total_v = 0.0
+                for d, s in in_radius:
+                    w = 1.0 / max(d, 1e-6)
+                    total_w += w
+                    total_v += w * float(s["value"])
+                value = total_v / total_w if total_w else None
+            else:
+                value = float(in_radius[0][1]["value"])
+            nearest = in_radius[0][1]
+            dist_km = in_radius[0][0]
+            return (
+                value,
+                nearest["city_id"],
+                nearest.get("city_name"),
+                dist_km,
+            )
+        except Exception as e:
+            logger.warning(f"Fel vid get_parameter_for_city_or_nearest: {e}")
+            return (None, None, None, None)
+
     def get_latest_pollutant_values(self, city_id: int) -> Optional[Dict]:
         """
         Get latest pollutant values for a city.
@@ -2195,27 +2740,53 @@ class DatabaseManager:
         try:
             conn = self._get_connection()
             cursor = conn.cursor()
-            cursor.execute(
-                """SELECT c.id AS city_id,
-                          c.name AS city_name,
-                          c.latitude,
-                          c.longitude,
-                          wd.temperature,
-                          wd.humidity,
-                          wd.wind_speed,
-                          wd.pm25,
-                          wd.no2,
-                          wd.o3
-                   FROM cities c
-                   INNER JOIN weather_data wd ON wd.city_id = c.id
-                   INNER JOIN (
-                       SELECT city_id, MAX(COALESCE(measurement_timestamp, timestamp)) AS max_ts
-                       FROM weather_data
-                       GROUP BY city_id
-                   ) latest ON wd.city_id = latest.city_id
-                          AND COALESCE(wd.measurement_timestamp, wd.timestamp) = latest.max_ts
-                   ORDER BY c.name"""
-            )
+            sql_with_meas = """
+                SELECT c.id AS city_id,
+                       c.name AS city_name,
+                       c.latitude,
+                       c.longitude,
+                       wd.temperature,
+                       wd.humidity,
+                       wd.wind_speed,
+                       wd.pm25,
+                       wd.no2,
+                       wd.o3,
+                       COALESCE(wd.measurement_timestamp, wd.timestamp) AS measurement_ts
+                FROM cities c
+                INNER JOIN weather_data wd ON wd.city_id = c.id
+                INNER JOIN (
+                    SELECT city_id, MAX(COALESCE(measurement_timestamp, timestamp)) AS max_ts
+                    FROM weather_data
+                    GROUP BY city_id
+                ) latest ON wd.city_id = latest.city_id
+                       AND COALESCE(wd.measurement_timestamp, wd.timestamp) = latest.max_ts
+                ORDER BY c.name
+            """
+            sql_ts_only = """
+                SELECT c.id AS city_id,
+                       c.name AS city_name,
+                       c.latitude,
+                       c.longitude,
+                       wd.temperature,
+                       wd.humidity,
+                       wd.wind_speed,
+                       wd.pm25,
+                       wd.no2,
+                       wd.o3,
+                       wd.timestamp AS measurement_ts
+                FROM cities c
+                INNER JOIN weather_data wd ON wd.city_id = c.id
+                INNER JOIN (
+                    SELECT city_id, MAX(timestamp) AS max_ts
+                    FROM weather_data
+                    GROUP BY city_id
+                ) latest ON wd.city_id = latest.city_id AND wd.timestamp = latest.max_ts
+                ORDER BY c.name
+            """
+            try:
+                cursor.execute(sql_with_meas)
+            except sqlite3.OperationalError:
+                cursor.execute(sql_ts_only)
             return [dict(row) for row in cursor.fetchall()]
         except Exception as e:
             logger.warning(f"Fel vid get_cities_with_weather_for_map: {e}")
@@ -2224,30 +2795,572 @@ class DatabaseManager:
     def get_national_pm25_7day_average(self) -> Optional[float]:
         """
         Compute the mean PM2.5 across all cities over the last 168 hours.
+        Uses get_parameter_for_city_or_nearest per city so cities without a sensor
+        contribute via nearest-station fallback when calibration enables it.
 
         Returns:
             Mean PM2.5 as float, or None if no data exists.
         """
         try:
-            conn = self._get_connection()
-            cursor = conn.cursor()
-            cursor.execute(
-                """SELECT AVG(pm25) AS mean_pm25
-                   FROM weather_data
-                   WHERE pm25 IS NOT NULL
-                     AND timestamp > datetime('now', '-168 hours')"""
-            )
-            row = cursor.fetchone()
-            if row and row["mean_pm25"] is not None:
-                return float(row["mean_pm25"])
-            return None
+            cities = self.get_all_cities()
+            if not cities:
+                return None
+            values = []
+            for c in cities:
+                val, _src_id, _src_name, _dist = self.get_parameter_for_city_or_nearest(
+                    c["id"], "pm25", hours=168
+                )
+                if val is not None:
+                    values.append(val)
+            if not values:
+                return None
+            return sum(values) / len(values)
         except Exception as e:
             logger.warning(f"Fel vid get_national_pm25_7day_average: {e}")
             return None
 
+    def get_normalization_profile_for_parameter(self, parameter: str) -> Optional[Dict[str, Any]]:
+        """
+        Return normalization_profile row joined from parameter_registry for parameter_name.
+        Raises nothing; returns None if missing profile link or table missing.
+        """
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT pr.parameter_name AS parameter_name,
+                       np.id AS id,
+                       np.profile_key AS profile_key,
+                       np.mode AS mode,
+                       np.p_low AS p_low,
+                       np.p_high AS p_high,
+                       np.history_days AS history_days,
+                       np.fixed_min AS fixed_min,
+                       np.fixed_max AS fixed_max
+                FROM parameter_registry pr
+                LEFT JOIN normalization_profile np ON np.id = pr.normalization_profile_id
+                WHERE pr.parameter_name = ?
+                """,
+                (parameter,),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return None
+            d = dict(row)
+            if d.get("id") is None:
+                return None
+            return d
+        except sqlite3.OperationalError as e:
+            logger.warning(f"get_normalization_profile_for_parameter: {e}")
+            return None
+
+    def get_normalization_profile_by_key(self, profile_key: str) -> Optional[Dict[str, Any]]:
+        """
+        Load normalization_profile by unique profile_key (e.g. heatmap confidence components).
+        """
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT id, profile_key, mode, p_low, p_high, history_days, fixed_min, fixed_max
+                FROM normalization_profile
+                WHERE profile_key = ?
+                """,
+                (profile_key,),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return None
+            return dict(row)
+        except sqlite3.OperationalError as e:
+            logger.warning(f"get_normalization_profile_by_key: {e}")
+            return None
+
+    def get_weather_data_column_names(self) -> Set[str]:
+        """
+        Column names on weather_data (for guarding winsor/SQL paths).
+        Registry can list parameters not yet materialized as columns.
+        """
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA table_info(weather_data)")
+            return {str(row[1]) for row in cursor.fetchall()}
+        except sqlite3.OperationalError:
+            return set()
+
+    def count_parameter_samples_in_window(
+        self, parameter: str, history_days: float
+    ) -> int:
+        """
+        Count non-null weather_data samples for diagnostics (same window semantics as winsor path).
+        """
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            cursor.execute(
+                f"""
+                SELECT COUNT(*) FROM weather_data
+                WHERE {parameter} IS NOT NULL
+                  AND timestamp >= datetime('now', '-' || ? || ' days')
+                """,
+                (float(history_days),),
+            )
+            row = cursor.fetchone()
+            return int(row[0]) if row and row[0] is not None else 0
+        except Exception as e:
+            logger.warning(f"count_parameter_samples_in_window({parameter}): {e}")
+            return 0
+
+    def get_heatmap_confidence_visual_mapping(self) -> Dict[str, Dict[str, Any]]:
+        """
+        DB-driven UI mapping for heatmap confidence levels (opacity multiplier, badge keys).
+        Fails loud if table missing or no rows (caller should treat empty as contract violation).
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                """
+                SELECT confidence_level, heatmap_opacity_multiplier, badge_style_key, badge_label_sv
+                FROM heatmap_confidence_visual_mapping
+                """
+            )
+            rows = cursor.fetchall()
+        except sqlite3.OperationalError as e:
+            raise RuntimeError(
+                "heatmap_confidence_visual_mapping table missing; run migration_map_init_and_data_quality.sql"
+            ) from e
+        out: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            d = dict(row)
+            lvl = str(d["confidence_level"])
+            out[lvl] = {
+                "opacity_multiplier": float(d["heatmap_opacity_multiplier"]),
+                "badge_style_key": str(d["badge_style_key"]),
+                "badge_label_sv": str(d.get("badge_label_sv") or ""),
+            }
+        return out
+
+    def get_heatmap_interpolation_config_row(self, context_key: str = "pm25_heatmap") -> Optional[Dict[str, Any]]:
+        """Single heatmap_interpolation_config row; None if table missing."""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("SELECT * FROM heatmap_interpolation_config WHERE context_key = ?", (context_key,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+        except sqlite3.OperationalError:
+            return None
+
+    def get_heatmap_confidence_features(self, context_key: str = "pm25_heatmap") -> List[Dict[str, Any]]:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                """
+                SELECT id, context_key, feature_key, weight, profile_key, enabled, sort_order
+                FROM heatmap_confidence_feature
+                WHERE context_key = ?
+                ORDER BY sort_order, id
+                """,
+                (context_key,),
+            )
+            return [dict(r) for r in cursor.fetchall()]
+        except sqlite3.OperationalError:
+            return []
+
+    def get_heatmap_confidence_aggregate_row(self, context_key: str = "pm25_heatmap") -> Optional[Dict[str, Any]]:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("SELECT * FROM heatmap_confidence_aggregate WHERE context_key = ?", (context_key,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+        except sqlite3.OperationalError:
+            return None
+
+    def get_heatmap_confidence_threshold_row(self, context_key: str = "pm25_heatmap") -> Optional[Dict[str, Any]]:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("SELECT * FROM heatmap_confidence_threshold WHERE context_key = ?", (context_key,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+        except sqlite3.OperationalError:
+            return None
+
+    def insert_heatmap_render_debug(
+        self,
+        render_id: str,
+        cell_i: int,
+        cell_j: int,
+        json_features: str,
+        cell_score: Optional[float],
+        *,
+        context_key: str = "pm25_heatmap",
+    ) -> None:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        with _write_lock:
+            cursor.execute(
+                """
+                INSERT INTO heatmap_render_debug (render_id, cell_i, cell_j, json_features, cell_score, context_key)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (render_id, cell_i, cell_j, json_features, cell_score, context_key),
+            )
+            conn.commit()
+
+    def cleanup_heatmap_render_debug(self) -> None:
+        """Delete debug rows older than heatmap_debug_retention_days (calibration)."""
+        try:
+            days = self.get_calibration_parameter("heatmap_debug_retention_days")
+        except Exception:
+            days = 7.0
+        try:
+            d = float(days) if days is not None else 7.0
+        except (TypeError, ValueError):
+            d = 7.0
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        try:
+            with _write_lock:
+                cursor.execute(
+                    """
+                    DELETE FROM heatmap_render_debug
+                    WHERE datetime(created_at) < datetime('now', '-' || ? || ' days')
+                    """,
+                    (int(max(1, d)),),
+                )
+                conn.commit()
+        except sqlite3.OperationalError:
+            pass
+
+    def validate_heatmap_engine_config(self) -> None:
+        """
+        Fail loud if heatmap_interpolation_config exists but JSON contracts are invalid.
+        If table or seed row is missing (partial DB), skip — map build will fail loud when needed.
+        """
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='heatmap_interpolation_config'"
+        )
+        if cursor.fetchone() is None:
+            return
+        row = self.get_heatmap_interpolation_config_row("pm25_heatmap")
+        if row is None:
+            logger.warning(
+                "heatmap_interpolation_config: no row for pm25_heatmap — skipping JSON validation"
+            )
+            return
+        validate_method_selection_rules(row.get("method_selection_rules"))
+        validate_spatial_index_rules(row.get("spatial_index_rules"))
+        validate_global_score_clip(row.get("global_score_clipping"))
+        rs = row.get("radius_shrink_spec")
+        if rs is not None and str(rs).strip() != "":
+            from utils.heatmap_json_validation import validate_radius_shrink_spec
+
+            validate_radius_shrink_spec(rs)
+
+    def get_map_tile_provider_row(self) -> Dict[str, Any]:
+        """
+        Single active basemap contract row (id=1): url_template, attribution_html,
+        subdomains, min_zoom, max_zoom, user_agent.
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                """
+                SELECT id, url_template, attribution_html, subdomains, min_zoom, max_zoom, user_agent
+                FROM map_tile_provider WHERE id = 1
+                """
+            )
+            row = cursor.fetchone()
+        except sqlite3.OperationalError as e:
+            raise RuntimeError(
+                "map_tile_provider table missing; run migration_map_tile_provider.sql"
+            ) from e
+        if row is None:
+            raise RuntimeError("map_tile_provider row id=1 missing")
+        return dict(row)
+
+    def get_map_tile_provider_for_payload(self) -> Dict[str, Any]:
+        """
+        Fields for Leaflet PAYLOAD.map_tile (JSON-serialized; no raw URL in JS f-strings).
+        """
+        row = self.get_map_tile_provider_row()
+        out: Dict[str, Any] = {
+            "url_template": str(row["url_template"]),
+            "attribution_html": str(row["attribution_html"]),
+        }
+        sd = row.get("subdomains")
+        if sd is not None and str(sd).strip():
+            out["subdomains"] = str(sd).strip()
+        if row.get("min_zoom") is not None:
+            out["min_zoom"] = int(row["min_zoom"])
+        if row.get("max_zoom") is not None:
+            out["max_zoom"] = int(row["max_zoom"])
+        return out
+
+    def validate_map_tile_contract(self) -> None:
+        """
+        Fail loud if basemap provider row is missing or violates OSM pairing rules.
+        """
+        row = self.get_map_tile_provider_row()
+        ut = str(row.get("url_template") or "").strip()
+        att = str(row.get("attribution_html") or "").strip()
+        ua = str(row.get("user_agent") or "").strip()
+        if not ut or not att or not ua:
+            raise RuntimeError(
+                "map_tile_provider: url_template, attribution_html, and user_agent must be non-empty"
+            )
+        lu = ut.lower()
+        la = att.lower()
+        if "openstreetmap.org" in lu or "tile.openstreetmap.org" in lu:
+            if "openstreetmap" not in la and "osm" not in la:
+                raise RuntimeError(
+                    "map_tile_provider: attribution_html must reference OpenStreetMap when url_template uses OSM tiles"
+                )
+
+    def get_normalization_readiness_report(
+        self,
+        *,
+        winsor_min_samples: int = 20,
+    ) -> Dict[str, Any]:
+        """
+        Per-parameter normalization readiness: usable | unstable | unusable.
+
+        - unusable: missing normalization_profile link, or invalid/constant winsor bounds
+        - unstable: winsor profile but insufficient samples for bounds in current window
+        - usable: identity/fixed_domain valid, or winsor bounds with lo < hi
+
+        Heavy detail stays out of this structure; consumers attach debug traces separately.
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                """
+                SELECT pr.parameter_name,
+                       pr.normalization_profile_id,
+                       np.id AS np_id,
+                       np.profile_key,
+                       np.mode,
+                       np.p_low,
+                       np.p_high,
+                       np.history_days,
+                       np.fixed_min,
+                       np.fixed_max
+                FROM parameter_registry pr
+                LEFT JOIN normalization_profile np ON np.id = pr.normalization_profile_id
+                ORDER BY pr.parameter_name
+                """
+            )
+            rows = cursor.fetchall()
+        except sqlite3.OperationalError as e:
+            return {
+                "error": str(e),
+                "parameters": [],
+                "unusable_count": 0,
+                "unstable_count": 0,
+                "usable_count": 0,
+                "registry_revision": self.parameter_registry_revision,
+            }
+
+        hist_override = self.get_calibration_parameter("normalization_history_days")
+        history_days = float(hist_override) if hist_override is not None else 30.0
+
+        w_cal = self.get_calibration_parameter("normalization_winsor_min_samples")
+        if w_cal is not None:
+            winsor_min_samples = max(1, int(w_cal))
+
+        weather_columns = self.get_weather_data_column_names()
+
+        parameters: List[Dict[str, Any]] = []
+
+        for row in rows:
+            d = dict(row)
+            name = str(d["parameter_name"])
+            np_id = d.get("np_id")
+            mode = d.get("mode")
+            entry: Dict[str, Any] = {"parameter_name": name, "status": "unusable", "reasons": []}
+
+            if np_id is None or mode is None:
+                entry["reasons"].append("missing_normalization_profile")
+                parameters.append(entry)
+                continue
+
+            if mode == "identity":
+                entry["status"] = "usable"
+                parameters.append(entry)
+                continue
+
+            if mode == "fixed_domain":
+                lo = d.get("fixed_min")
+                hi = d.get("fixed_max")
+                if lo is None or hi is None:
+                    entry["reasons"].append("fixed_domain_missing_bounds")
+                elif float(hi) <= float(lo):
+                    entry["reasons"].append("constant_fixed_domain")
+                else:
+                    entry["status"] = "usable"
+                parameters.append(entry)
+                continue
+
+            if mode == "winsorized_percentile":
+                p_low = d.get("p_low")
+                p_high = d.get("p_high")
+                if p_low is None or p_high is None:
+                    entry["reasons"].append("winsor_missing_percentiles")
+                    parameters.append(entry)
+                    continue
+                if name not in weather_columns:
+                    entry["reasons"].append("no_weather_data_column")
+                    parameters.append(entry)
+                    continue
+                hist_days = d.get("history_days")
+                hist_use = float(hist_days) if hist_days is not None else history_days
+                bounds = self.get_parameter_winsorized_bounds(
+                    name,
+                    float(p_low),
+                    float(p_high),
+                    history_days_override=hist_use,
+                    include_meta=True,
+                )
+                lo_b, hi_b, meta = bounds  # type: ignore[misc]
+                if lo_b is None or hi_b is None:
+                    n_s = self.count_parameter_samples_in_window(name, hist_use)
+                    entry["status"] = "unstable"
+                    entry["reasons"].append("insufficient_samples_for_winsor")
+                    entry["n_samples"] = n_s
+                    entry["winsor_min_samples"] = winsor_min_samples
+                elif float(hi_b) <= float(lo_b):
+                    entry["reasons"].append("constant_winsor_bounds")
+                else:
+                    entry["status"] = "usable"
+                    if meta and meta.get("n_samples") is not None:
+                        n_s = int(meta["n_samples"])
+                        entry["n_samples"] = n_s
+                        if n_s < winsor_min_samples * 2:
+                            entry["status"] = "unstable"
+                            entry["reasons"].append("low_sample_count")
+                parameters.append(entry)
+                continue
+
+            entry["reasons"].append(f"unknown_normalization_mode:{mode}")
+            parameters.append(entry)
+
+        usable_count = sum(1 for p in parameters if p.get("status") == "usable")
+        unstable_count = sum(1 for p in parameters if p.get("status") == "unstable")
+        unusable_count = sum(1 for p in parameters if p.get("status") == "unusable")
+
+        return {
+            "parameters": parameters,
+            "unusable_count": unusable_count,
+            "unstable_count": unstable_count,
+            "usable_count": usable_count,
+            "registry_revision": self.parameter_registry_revision,
+            "winsor_min_samples": winsor_min_samples,
+        }
+
+    def _load_cape_piecewise_segments(self) -> List[Dict[str, Any]]:
+        if self._cape_segments_cache is not None:
+            return self._cape_segments_cache
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                """
+                SELECT sort_order, lower_bound_jkg, upper_bound_jkg, storm_risk_factor, display_suffix_sv
+                FROM cape_piecewise_segment
+                ORDER BY sort_order ASC
+                """
+            )
+            rows = [dict(r) for r in cursor.fetchall()]
+        except sqlite3.OperationalError as e:
+            logger.warning(f"_load_cape_piecewise_segments: {e}")
+            rows = []
+        self._cape_segments_cache = rows
+        return rows
+
+    def get_cape_storm_risk_factor(self, cape: Optional[float]) -> float:
+        """
+        Piecewise CAPE factor for storm_risk (DB: cape_piecewise_segment). Parity with legacy thresholds.
+        """
+        if cape is None or cape <= 0.0:
+            return 0.0
+        segs = self._load_cape_piecewise_segments()
+        if not segs:
+            raise RuntimeError(
+                "cape_piecewise_segment is empty; run migration_add_cape_piecewise.sql"
+            )
+        v = float(cape)
+        for seg in segs:
+            lo = float(seg["lower_bound_jkg"])
+            upper = seg["upper_bound_jkg"]
+            if upper is None:
+                if v >= lo:
+                    return float(seg["storm_risk_factor"])
+            else:
+                hi = float(upper)
+                if lo <= v < hi:
+                    return float(seg["storm_risk_factor"])
+        return float(segs[-1]["storm_risk_factor"])
+
+    def get_cape_display_suffix_sv(self, cape: Optional[float]) -> str:
+        """CAPE category suffix for UI (Swedish), from cape_piecewise_segment."""
+        if cape is None:
+            return ""
+        if cape == 0:
+            return " (ingen konvektiv energi)"
+        segs = self._load_cape_piecewise_segments()
+        if not segs:
+            raise RuntimeError(
+                "cape_piecewise_segment is empty; run migration_add_cape_piecewise.sql"
+            )
+        v = float(cape)
+        for seg in segs:
+            lo = float(seg["lower_bound_jkg"])
+            upper = seg["upper_bound_jkg"]
+            if upper is None:
+                if v >= lo:
+                    return str(seg.get("display_suffix_sv") or "")
+            else:
+                hi = float(upper)
+                if lo <= v < hi:
+                    return str(seg.get("display_suffix_sv") or "")
+        return str(segs[-1].get("display_suffix_sv") or "")
+
+    def get_composite_index_definition_json(self, index_key: str) -> str:
+        """Return raw JSON string from composite_index_definition (validated by callers)."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT config_json FROM composite_index_definition WHERE index_key = ?",
+            (index_key,),
+        )
+        row = cursor.fetchone()
+        if row is None or row[0] is None:
+            raise ValueError(f"Missing composite_index_definition for index_key={index_key!r}")
+        return str(row[0])
+
     def get_parameter_winsorized_bounds(
-        self, parameter: str, p_low: int, p_high: int
-    ) -> Tuple[Optional[float], Optional[float]]:
+        self,
+        parameter: str,
+        p_low: float,
+        p_high: float,
+        *,
+        history_days_override: Optional[float] = None,
+        include_meta: bool = False,
+    ) -> Union[
+        Tuple[Optional[float], Optional[float]],
+        Tuple[Optional[float], Optional[float], Optional[Dict[str, Any]]],
+    ]:
         """
         Return winsorized (percentile-based) bounds for a weather_data column.
 
@@ -2261,6 +3374,8 @@ class DatabaseManager:
                        Only whitelisted column names are accepted.
             p_low:     Lower percentile (0–100).
             p_high:    Upper percentile (0–100).
+            history_days_override: If set, overrides normalization_history_days from calibration.
+            include_meta: If True, returns (lo, hi, meta_dict) for debug/trace.
 
         Returns:
             (lower_bound, upper_bound) as floats, or (None, None) if fewer
@@ -2284,6 +3399,8 @@ class DatabaseManager:
                         logger.warning(
                             f"get_parameter_winsorized_bounds: parameter '{parameter}' not found in parameter_registry after auto-discovery"
                         )
+                        if include_meta:
+                            return None, None, None
                         return None, None
             else:
                 # Table doesn't exist - use fallback whitelist for backward compatibility
@@ -2295,6 +3412,8 @@ class DatabaseManager:
                     logger.warning(
                         f"get_parameter_winsorized_bounds: parameter '{parameter}' not in fallback whitelist (parameter_registry table missing)"
                     )
+                    if include_meta:
+                        return None, None, None
                     return None, None
         except Exception as e:
             logger.warning(f"Fel vid kontroll av parameter_registry för '{parameter}': {e}")
@@ -2307,27 +3426,32 @@ class DatabaseManager:
                 logger.warning(
                     f"get_parameter_winsorized_bounds: parameter '{parameter}' not in fallback whitelist (error checking registry)"
                 )
+                if include_meta:
+                    return None, None, None
                 return None, None
 
         try:
             conn = self._get_connection()
             cursor = conn.cursor()
-            
+
             # Get historical data period from calibration_parameters (days)
             # Default to 30 days if not configured (meteorologically better than 7 days)
-            history_days = self.get_calibration_parameter('normalization_history_days')
-            if history_days is None:
-                history_days = 30.0  # Default: 30 days (meteorologically better)
+            if history_days_override is not None:
+                history_days = float(history_days_override)
             else:
-                history_days = float(history_days)
-            
+                history_days = self.get_calibration_parameter("normalization_history_days")
+                if history_days is None:
+                    history_days = 30.0  # Default: 30 days (meteorologically better)
+                else:
+                    history_days = float(history_days)
+
             # Fetch sorted history within time window — column name is safe because of whitelist above
             cursor.execute(
                 f"SELECT {parameter} FROM weather_data "
                 f"WHERE {parameter} IS NOT NULL "
                 f"AND timestamp >= datetime('now', '-' || ? || ' days') "
                 f"ORDER BY {parameter} ASC",
-                (history_days,)
+                (history_days,),
             )
             rows = [row[0] for row in cursor.fetchall()]
 
@@ -2337,16 +3461,30 @@ class DatabaseManager:
                     f"get_parameter_winsorized_bounds: insufficient history for "
                     f"'{parameter}' ({len(rows)} rows, need ≥ 20)"
                 )
+                if include_meta:
+                    return None, None, None
                 return None, None
 
             n = len(rows)
-            lo_idx = max(0, int(round(p_low  / 100 * (n - 1))))
+            lo_idx = max(0, int(round(p_low / 100 * (n - 1))))
             hi_idx = min(n - 1, int(round(p_high / 100 * (n - 1))))
-            return float(rows[lo_idx]), float(rows[hi_idx])
+            lo_b = float(rows[lo_idx])
+            hi_b = float(rows[hi_idx])
+            if include_meta:
+                meta = {
+                    "n_samples": n,
+                    "history_window_days": history_days,
+                    "p_low": float(p_low),
+                    "p_high": float(p_high),
+                }
+                return lo_b, hi_b, meta
+            return lo_b, hi_b
         except Exception as e:
             logger.warning(
                 f"Fel vid get_parameter_winsorized_bounds('{parameter}'): {e}"
             )
+            if include_meta:
+                return None, None, None
             return None, None
     
     def _auto_generate_normalization_bounds(self, parameter_name: str) -> bool:
@@ -2455,114 +3593,217 @@ class DatabaseManager:
     
     def _auto_discover_parameters_from_schema(self, conn: Optional[sqlite3.Connection] = None):
         """
-        Auto-discover parameters from weather_data schema and register them in parameter_registry.
-        Called on startup and after migrations.
-        
-        Args:
-            conn: Optional database connection (if None, uses _get_connection())
+        REPAIR MODE: reconcile weather_data columns into parameter_registry when a row is missing.
+
+        Primary source of truth is parameter_registry + migrations; this only fills gaps
+        (e.g. column exists without registry row). See ADR / docs: registry = SoT, schema = projection.
         """
         try:
             if conn is None:
                 conn = self._get_connection()
-            
-            # Check if parameter_registry table exists
+
             cursor = conn.cursor()
-            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='parameter_registry'")
+            cursor.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='parameter_registry'"
+            )
             if cursor.fetchone() is None:
-                logger.debug("parameter_registry tabell finns inte, hoppar över auto-discovery")
+                logger.debug("parameter_registry tabell finns inte, hoppar över REPAIR MODE discovery")
                 return
-            
-            # Get all columns from weather_data schema
+
+            cursor.execute("PRAGMA table_info(parameter_registry)")
+            registry_columns = [row[1] for row in cursor.fetchall()]
+
             cursor.execute("PRAGMA table_info(weather_data)")
             columns = [row[1] for row in cursor.fetchall()]
-            
-            # Filter out non-parameter columns
-            excluded = {'id', 'city_id', 'timestamp', 'source', 'aqi', 'measurement_timestamp'}
+
+            excluded = {"id", "city_id", "timestamp", "source", "aqi", "measurement_timestamp"}
             parameter_columns = [col for col in columns if col not in excluded]
-            
-            logger.info(f"Auto-upptäcker parametrar från schema: {len(parameter_columns)} parametrar...")
-            
-            # Category inference mapping
+
+            logger.info(
+                f"REPAIR MODE: auto-discovery från weather_data-schema: {len(parameter_columns)} kolumner..."
+            )
+
             category_map = {
-                'pm25': 'air_quality',
-                'pm10': 'air_quality',
-                'no2': 'air_quality',
-                'o3': 'air_quality',
-                'uv_index': 'solar',
-                'solar_radiation': 'solar',
-                'direct_radiation': 'solar',
-                'diffuse_radiation': 'solar',
-                'sunshine_duration': 'solar',
-                'cape': 'storm',
-                'precipitation_probability': 'storm',
-                'convective_precipitation': 'storm',
-                'temperature': 'weather',
-                'humidity': 'weather',
-                'wind_speed': 'weather'
+                "pm25": "air_quality",
+                "pm10": "air_quality",
+                "no2": "air_quality",
+                "o3": "air_quality",
+                "uv_index": "solar",
+                "solar_radiation": "solar",
+                "direct_radiation": "solar",
+                "diffuse_radiation": "solar",
+                "sunshine_duration": "solar",
+                "cape": "storm",
+                "precipitation_probability": "storm",
+                "convective_precipitation": "storm",
+                "temperature": "weather",
+                "humidity": "weather",
+                "wind_speed": "weather",
             }
-            
-            # Unit inference mapping
             unit_map = {
-                'pm25': 'µg/m³',
-                'pm10': 'µg/m³',
-                'no2': 'µg/m³',
-                'o3': 'µg/m³',
-                'uv_index': 'index',
-                'solar_radiation': 'W/m²',
-                'direct_radiation': 'W/m²',
-                'diffuse_radiation': 'W/m²',
-                'sunshine_duration': 'seconds',
-                'cape': 'J/kg',
-                'precipitation_probability': 'percent',
-                'convective_precipitation': 'mm',
-                'temperature': '°C',
-                'humidity': 'percent',
-                'wind_speed': 'm/s'
+                "pm25": "µg/m³",
+                "pm10": "µg/m³",
+                "no2": "µg/m³",
+                "o3": "µg/m³",
+                "uv_index": "index",
+                "solar_radiation": "W/m²",
+                "direct_radiation": "W/m²",
+                "diffuse_radiation": "W/m²",
+                "sunshine_duration": "seconds",
+                "cape": "J/kg",
+                "precipitation_probability": "percent",
+                "convective_precipitation": "mm",
+                "temperature": "°C",
+                "humidity": "percent",
+                "wind_speed": "m/s",
             }
-            
+
+            storm_family_key = {
+                "cape": "storm_cape",
+                "precipitation_probability": "storm_precipitation_probability",
+                "convective_precipitation": "storm_convective_precipitation",
+            }
+
             registered_count = 0
             for param in parameter_columns:
                 try:
-                    # Check if parameter already exists in registry
-                    cursor.execute("SELECT parameter_name FROM parameter_registry WHERE parameter_name = ?", (param,))
+                    cursor.execute(
+                        "SELECT parameter_name FROM parameter_registry WHERE parameter_name = ?",
+                        (param,),
+                    )
                     if cursor.fetchone() is not None:
-                        continue  # Already registered
-                    
-                    # Infer category and unit
-                    category = category_map.get(param, 'unknown')
-                    unit = unit_map.get(param, 'unknown')
-                    
-                    # Format display name (e.g., "pm25" → "PM2.5", "uv_index" → "UV Index")
-                    display_name = param.replace('_', ' ').title()
-                    if param == 'pm25':
-                        display_name = 'PM2.5'
-                    elif param == 'pm10':
-                        display_name = 'PM10'
-                    elif param == 'no2':
-                        display_name = 'NO₂'
-                    elif param == 'o3':
-                        display_name = 'O₃'
-                    
-                    # Insert into parameter_registry
-                    cursor.execute("""
-                        INSERT INTO parameter_registry (parameter_name, display_name, unit, category, description, source)
-                        VALUES (?, ?, ?, ?, ?, ?)
-                    """, (param, display_name, unit, category, f'Auto-discovered from schema', 'auto_discovery'))
-                    
+                        continue
+
+                    category = category_map.get(param, "unknown")
+                    unit = unit_map.get(param, "unknown")
+                    display_name = param.replace("_", " ").title()
+                    if param == "pm25":
+                        display_name = "PM2.5"
+                    elif param == "pm10":
+                        display_name = "PM10"
+                    elif param == "no2":
+                        display_name = "NO₂"
+                    elif param == "o3":
+                        display_name = "O₃"
+
+                    desc = "REPAIR MODE: column exists in weather_data without registry row"
+                    col_vals: Dict[str, Any] = {
+                        "parameter_name": param,
+                        "display_name": display_name,
+                        "unit": unit,
+                        "category": category,
+                        "description": desc,
+                    }
+                    if "source" in registry_columns:
+                        col_vals["source"] = "auto_discovery"
+                    if "backfill_support" in registry_columns:
+                        col_vals["backfill_support"] = default_backfill_support_json()
+                    if "variable_family_key" in registry_columns and param in storm_family_key:
+                        col_vals["variable_family_key"] = storm_family_key[param]
+                    if "variation_mode" in registry_columns:
+                        col_vals["variation_mode"] = "none"
+
+                    insert_cols = [c for c in col_vals if c in registry_columns]
+                    placeholders = ",".join(["?"] * len(insert_cols))
+                    qmarks = ",".join(insert_cols)
+                    sql = f"INSERT INTO parameter_registry ({qmarks}) VALUES ({placeholders})"
+                    vals = tuple(col_vals[c] for c in insert_cols)
+                    cursor.execute(sql, vals)
+
                     registered_count += 1
-                    logger.debug(f"Auto-registrerade parameter: {param} (category={category}, unit={unit})")
-                    
+                    logger.debug(
+                        f"REPAIR MODE: registrerade parameter {param} (category={category}, unit={unit})"
+                    )
+
                 except sqlite3.IntegrityError:
-                    # Parameter already exists, skip
                     continue
                 except Exception as e:
-                    logger.debug(f"Kunde inte registrera parameter {param}: {e}")
-            
+                    logger.warning(
+                        f"REPAIR MODE: kunde inte registrera parameter {param} i parameter_registry: {e}"
+                    )
+
             conn.commit()
-            logger.info(f"Auto-registrerade {registered_count} nya parametrar i parameter_registry")
-            
+            logger.info(
+                f"REPAIR MODE: registrerade {registered_count} nya rader i parameter_registry"
+            )
+            if registered_count:
+                self.bump_parameter_registry_revision()
+
         except Exception as e:
-            logger.warning(f"Fel vid parameter registry auto-discovery: {e}")
+            logger.warning(f"Fel vid REPAIR MODE parameter registry discovery: {e}")
+
+    def validate_registry_schema_sync(self) -> Dict[str, Any]:
+        """
+        Automated check: every weather_data parameter column has a parameter_registry row.
+
+        Returns:
+            Dict with ok (bool), missing_registry_rows, weather_columns_checked, optional error.
+        """
+        excluded = {"id", "city_id", "timestamp", "source", "aqi", "measurement_timestamp"}
+        result: Dict[str, Any] = {
+            "ok": True,
+            "missing_registry_rows": [],
+            "weather_columns_checked": [],
+        }
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='parameter_registry'"
+            )
+            if cursor.fetchone() is None:
+                result["ok"] = False
+                result["error"] = "parameter_registry table missing"
+                return result
+
+            cursor.execute("PRAGMA table_info(weather_data)")
+            cols = [row[1] for row in cursor.fetchall()]
+            param_cols = [c for c in cols if c not in excluded]
+            result["weather_columns_checked"] = list(param_cols)
+
+            missing: List[str] = []
+            for c in param_cols:
+                cursor.execute(
+                    "SELECT 1 FROM parameter_registry WHERE parameter_name = ? LIMIT 1",
+                    (c,),
+                )
+                if cursor.fetchone() is None:
+                    missing.append(c)
+            result["missing_registry_rows"] = missing
+            if missing:
+                result["ok"] = False
+        except Exception as e:
+            result["ok"] = False
+            result["error"] = str(e)
+        return result
+
+    def parameter_allows_archive_backfill(self, parameter_name: str) -> bool:
+        """Read validated backfill_support.archive from parameter_registry (default True if unset)."""
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA table_info(parameter_registry)")
+            cols = [row[1] for row in cursor.fetchall()]
+            if "backfill_support" not in cols:
+                return True
+            cursor.execute(
+                "SELECT backfill_support FROM parameter_registry WHERE parameter_name = ?",
+                (parameter_name,),
+            )
+            row = cursor.fetchone()
+            if not row or row[0] is None or str(row[0]).strip() == "":
+                return True
+            try:
+                d = validate_backfill_support(row[0])
+            except ValueError as e:
+                logger.warning(
+                    f"parameter_allows_archive_backfill: ogiltig backfill_support för {parameter_name}: {e}"
+                )
+                return False
+            return bool(d.get("archive", True))
+        except Exception as e:
+            logger.warning(f"parameter_allows_archive_backfill({parameter_name}): {e}")
+            return True
 
     # Calibration parameters
     def get_calibration_parameter(self, key: str) -> Optional[float]:

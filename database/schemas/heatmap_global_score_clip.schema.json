@@ -1,0 +1,11 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "heatmap_global_score_clip",
+  "type": "object",
+  "required": [],
+  "properties": {
+    "min": { "type": ["number", "null"] },
+    "max": { "type": ["number", "null"] }
+  },
+  "additionalProperties": false
+}

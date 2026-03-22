@@ -9,6 +9,7 @@ from typing import Optional
 import logging
 
 from database.db_manager import DatabaseManager
+from analytics.normalization_engine import NormalizationEngine
 
 
 logger = logging.getLogger("WeatherApp.analytics.storm_risk")
@@ -19,44 +20,19 @@ class StormRiskCalculator:
 
     def __init__(self, db: DatabaseManager):
         self._db = db
+        self._norm = NormalizationEngine(db)
 
     # --- Normalisation helpers -------------------------------------------------
     def _normalize(self, value: Optional[float], parameter: str) -> Optional[float]:
-        """Normalize value to [0, 1] using winsorized bounds."""
+        """Normalize value to [0, 1] using normalization_profile + winsor bounds."""
         if value is None:
             return None
-
-        bounds = self._db.get_parameter_winsorized_bounds(parameter, 5.0, 95.0)
-        if not bounds or bounds[0] is None or bounds[1] is None:
-            logger.debug(
-                "StormRisk: no winsorized bounds for %s, cannot normalize", parameter
-            )
-            return None
-
-        lo, hi = bounds
-        if hi <= lo:
-            logger.warning("StormRisk: invalid bounds for %s: lo=%s hi=%s", parameter, lo, hi)
-            return None
-
-        norm = (value - lo) / (hi - lo)
-        return max(0.0, min(1.0, norm))
+        out, _ = self._norm.normalize(parameter, value, debug_trace=False)
+        return out
 
     def _cape_factor(self, cape: float) -> float:
-        """
-        Piecewise scaling factor for CAPE.
-
-        Thresholds follow docs/ANALYTICAL_MAP.md qualitatively:
-        0, 100, 1000, 2500 J/kg.
-        """
-        if cape is None or cape <= 0.0:
-            return 0.0
-        if cape < 100.0:
-            return 0.3
-        if cape < 1000.0:
-            return 1.0
-        if cape < 2500.0:
-            return 1.5
-        return 2.0
+        """Piecewise scaling factor for CAPE from cape_piecewise_segment (DB)."""
+        return self._db.get_cape_storm_risk_factor(cape)
 
     # --- Public API ------------------------------------------------------------
     def calculate(self, city_id: int) -> Optional[float]:

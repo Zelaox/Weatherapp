@@ -118,7 +118,7 @@ class StatisticsCalculator:
         best_pm25 = None
         
         for city in cities:
-            pm25_avg = self.db.get_24h_rolling_average(city['id'], 'pm25')
+            pm25_avg = self.db.get_parameter_for_city_or_nearest(city['id'], 'pm25', hours=24)[0]
             if pm25_avg is not None:
                 if best_pm25 is None or pm25_avg < best_pm25:
                     best_pm25 = pm25_avg
@@ -153,7 +153,7 @@ class StatisticsCalculator:
         worst_pm25 = None
         
         for city in cities:
-            pm25_avg = self.db.get_24h_rolling_average(city['id'], 'pm25')
+            pm25_avg = self.db.get_parameter_for_city_or_nearest(city['id'], 'pm25', hours=24)[0]
             if pm25_avg is not None:
                 if worst_pm25 is None or pm25_avg > worst_pm25:
                     worst_pm25 = pm25_avg

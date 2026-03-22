@@ -138,8 +138,8 @@ class DailyMode(BaseMode):
         
         df = self._ensure_timezone_aware(df.copy())
         
-        # Filter exact one day
-        df_day = df[df["timestamp"].dt.date == selected_date]
+        # Filter exact one day (use .copy() to avoid SettingWithCopyWarning when adding column)
+        df_day = df[df["timestamp"].dt.date == selected_date].copy()
         
         # If no data for this day, return empty DataFrame (NO fallback)
         if df_day.empty:

@@ -1,5 +1,7 @@
 # Analytical Map — Architecture & Model Documentation
 
+**See also:** [DATABASE.md](DATABASE.md) (SQLite, parameter registry, wind flow), [SETTINGS.md](SETTINGS.md) (GUI settings).
+
 ## Table of Contents
 
 1. [Overview](#overview)
@@ -159,6 +161,31 @@ Builds the complete payload consumed by Leaflet. Instantiated fresh on every map
     },
     "idw_grid":       [[lat, lon, value], ...],  # IDW interpolation grid for PM2.5 heatmap
     "idw_meta":       {...},                     # grid geometry metadata
+    "heatmap_confidence": {                      # DB-driven model (calibration + normalization_profile); see DATABASE.md §2b
+        "level": str,                            # "ok" | "low" | "unreliable"
+        "score": float,
+        "reasons": [str, ...],
+        "coverage_fraction": float,
+        "n_stations": int,
+        "grid_cells_total": int,
+        "mean_interpolation_distance_km": float | None,
+        "formula_version": float,
+        "components": {
+            "station_score": float,
+            "coverage_score": float,
+            "distance_score": float | None,
+        },
+    },
+    "heatmap_confidence_visual": {               # Rows from heatmap_confidence_visual_mapping (opacity + badge text)
+        "ok": {...}, "low": {...}, "unreliable": {...},
+    },
+    "map_init_timeout_ms": int,
+    "normalization_readiness": {                 # Always-on summary; full report in map_debug when debug_mode
+        "unusable_parameters": [str, ...],
+        "unstable_count": int,
+        "unusable_count": int,
+        "registry_revision": int | None,
+    },
     "idw_max":        float,                     # p95 colour-scale anchor
     "idw_true_max":   float,                     # actual grid maximum
     "solar_layer":    [{"lat": float, "lon": float, "solar_index": float}, ...],  # Solar index heatmap points
@@ -166,6 +193,8 @@ Builds the complete payload consumed by Leaflet. Instantiated fresh on every map
     "lightning_layer": [{"lat": float, "lon": float, "timestamp": str, "intensity": float}, ...],  # Lightning strike markers
 }
 ```
+
+Optional `map_debug` is included when the app setting `debug_mode` is enabled (heatmap confidence diagnostics and counts; not persisted per analytical row).
 
 ---
 
@@ -353,12 +382,13 @@ WHERE pm25 IS NOT NULL
 
 The 168-hour window (7 days) is the cluster analysis baseline. Returns `None` if no data exists.
 
-### `get_parameter_winsorized_bounds(parameter, p_low, p_high)`
+### `get_parameter_winsorized_bounds(parameter, p_low, p_high, ...)`
 
 ```python
-# Step 1 — SQL: fetch full sorted history
+# Step 1 — SQL: fetch full sorted history (within normalization_history_days window)
 SELECT {parameter} FROM weather_data
 WHERE {parameter} IS NOT NULL
+  AND timestamp >= datetime('now', '-' || ? || ' days')
 ORDER BY {parameter} ASC
 
 # Step 2 — Python: compute percentile indices
@@ -368,16 +398,13 @@ hi_idx = min(n - 1, int(round(p_high / 100 * (n - 1))))
 return rows[lo_idx], rows[hi_idx]
 ```
 
-**Security:** The `parameter` argument is validated against an explicit whitelist before being interpolated into the SQL string:
+**Security:** The `parameter` argument must exist in `parameter_registry` (with auto-discovery repair mode for missing rows). When `parameter_registry` is absent, a small legacy whitelist applies.
 
-```python
-ALLOWED_PARAMETERS = {
-    "wind_speed", "humidity", "temperature",
-    "pm25", "pm10", "no2", "o3", "aqi"
-}
-```
+Optional keyword-only arguments: `history_days_override`, `include_meta` (debug trace: `n_samples`, `history_window_days`, percentiles).
 
 Returns `(None, None)` if fewer than 20 rows exist.
+
+**Analytics normalization:** `analytics/normalization_engine.py` reads `normalization_profile` via `parameter_registry.normalization_profile_id` and uses percentiles from the profile (not hardcoded literals in callers).
 
 ---
 
@@ -390,45 +417,26 @@ The JavaScript in `_generate_map_html()` is a pure renderer. It receives `PAYLOA
 | Layer | Leaflet type | Toggle button |
 |---|---|---|
 | City AQI markers | `L.circleMarker` (inner dot + outer wind ring) | Stationer |
-| Heatmap | `L.heatLayer` (leaflet.heat CDN) | Heatmap |
+| Heatmap | `L.imageOverlay` (Python IDW grid → canvas → PNG) | Heatmap |
 | Raw sensor markers | `L.marker` | Sensorer |
 
-### Heatmap timing fix
+### Map container size readiness (event-driven)
 
-`leaflet.heat` calls `canvas.getImageData()` synchronously when `.addTo(map)` is called. Inside `QWebEngineView`, the Qt layout engine has not yet assigned pixel dimensions to the canvas at the time `map.whenReady()` fires. The heatmap creation is therefore deferred with:
+PM2.5 heatmap attachment **must not** run while Leaflet’s container has zero width/height (common right after `loadFinished` in `QWebEngineView`). The page uses a **`ResizeObserver`** on the map container plus **`map.invalidateSize()`** until `map.getSize()` is non-zero, then runs a single attach routine (`attachHeatOverlayOnce`). There is **no** `requestAnimationFrame` polling loop.
 
-```javascript
-setTimeout(function() {
-    if (typeof L.heatLayer !== "function") {
-        console.error("[Heatmap] leaflet.heat not loaded — heatLayer skipped");
-        return;
-    }
-    map.invalidateSize();   // force Qt layout recalculation
-    if (heatPoints.length > 0) {
-        heatLayer = L.heatLayer(heatPoints, { max: heatMax, ... }).addTo(map);
-    }
-}, 800);
-```
+If the container never becomes non-zero within **`map_init_size_ready_timeout_ms`** (from `calibration_parameters`, injected as `PAYLOAD.map_init_timeout_ms`), the script logs an explicit **`MAP_INIT_TIMEOUT`** error and **does not** attach the overlay.
 
-`map.invalidateSize()` forces Leaflet to re-query the container dimensions from the Qt layout engine before `leaflet.heat` touches the canvas. The 800 ms delay is the safe margin for Qt's layout pass to complete. 300 ms was insufficient on slower systems.
+### Basemap tiles and document origin (OSM policy)
 
-### Heatmap `max` is data-driven
+- **Table:** `map_tile_provider` — see [DATABASE.md](DATABASE.md) §2b. URL, attribution, subdomains, zoom bounds, and `user_agent` are **data**, not literals in Python/JS.
+- **`PAYLOAD.map_tile`:** built from the DB and embedded with the rest of the payload via **`json.dumps`** (correct escaping for URLs and attribution HTML).
+- **Leaflet:** `L.tileLayer(PAYLOAD.map_tile.url_template, { attribution, subdomains, minZoom, maxZoom })` — no hardcoded OSM URL in the template string.
+- **User-Agent:** the map `QWebEngineView` uses a **dedicated `QWebEngineProfile`** with `user_agent` from the same DB row.
+- **Why not `file://`:** the map document is served from a **process singleton** `http://127.0.0.1:<port>/map.html` ([`utils/local_map_server.py`](d:/AI/ChatGPT/My_programs/Weather app/utils/local_map_server.py)) so tile subrequests send a normal **`http` Referer**. Loading large HTML from `file://` avoids `setHtml` size limits but does not satisfy OSM **Referer** expectations for tile servers.
 
-`leaflet.heat` normalizes each point's intensity as `value / max`. A hardcoded `max` (e.g. 150 µg/m³) makes the heatmap invisible when ambient PM2.5 values are low (typical Swedish clean-air readings of 1–10 µg/m³ would render at < 7% intensity).
+### Heatmap colour scale (`heatMax`)
 
-`heatMax` is computed dynamically before the `setTimeout`:
-
-```javascript
-var heatMax = heatPoints.length > 0
-    ? Math.max.apply(null, heatPoints.map(function(p) { return p[2]; }))
-    : 1.0;
-```
-
-The full gradient always maps to the actual observed data range. No physics constant or threshold is introduced.
-
-### leaflet-heat bundled locally
-
-`leaflet-heat.js` is served as an inline `<script>` block — the file content is read from `ui/static/leaflet-heat.js` at HTML generation time. No CDN request is made at runtime. QWebEngine frequently blocks external CDN requests silently; inlining eliminates that failure mode entirely.
+The IDW grid is built in Python. `heatMax` / `idw_scale_percentile` come from **`calibration_parameters`** (see [DATABASE.md](DATABASE.md) §2b). The JS renderer maps cell values to colours using DB-driven clip bounds from `heatmap_config`; it does not invent scale constants.
 
 ### Popup components
 
@@ -457,7 +465,7 @@ Rendered at the bottom of the map from the `cluster_alerts` array. Only visible 
 
 ## Calibration Parameters (DB-driven)
 
-All analytical model parameters are stored in the `calibration_parameters` table and read from the database at runtime. No hardcoded constants remain in the codebase.
+Runtime map code reads analytical parameters from SQLite. **Canonical tables, keys, migrations, and math-layer contracts** are documented in [DATABASE.md](DATABASE.md) (especially §2b). This section keeps **inversion + IDW + extent** tables for narrative context only; do not duplicate the full heatmap-confidence / map-init key list here.
 
 ### Inversion Model Parameters
 
@@ -489,7 +497,13 @@ The geographic extent of the map and of all heatmap layers (PM2.5, solar, storm)
 
 - **Source**: Read from `calibration_parameters` at runtime (migration sets a default Sweden bbox, e.g. lat 55.3–69.1, lon 11–24.2). Values can be changed in the DB for other regions.
 - **Fallback**: If any of the four keys is missing or invalid, the extent is computed from the **bounding box of all cities** in the `cities` table (with 5% padding). Thus the map and heatmap always cover either the configured region or the full set of stations.
-- **Usage**: `MapDataBuilder._get_map_extent()` returns `(lat_min, lat_max, lon_min, lon_max)`. This extent is passed to `_compute_idw_grid` and `_compute_layer_idw_grid` so all heatmap layers share the same geographic box. The payload includes `map_extent`; the Leaflet map uses `fitBounds()` so the full extent is visible on load.
+- **Usage**: `MapDataBuilder._get_map_extent()` returns `(lat_min, lat_max, lon_min, lon_max)`. This extent is passed to `analytics/heatmap_interpolation.compute_pm25_heatmap` (PM2.5) and `_compute_layer_idw_grid` (solar/storm) so layers share the same geographic box. The payload includes `map_extent`; the Leaflet map uses `fitBounds()` so the full extent is visible on load.
+
+### PM2.5 heatmap engine (DB-driven)
+
+- **Implementation:** `analytics/heatmap_interpolation.py` — IDW grid, optional adaptive radius / shrink JSON, spatial/method rule evaluation, per-cell normalized features from `heatmap_confidence_feature`, global score from `heatmap_confidence_aggregate`, gates still from `calibration_parameters` (station/coverage) plus `heatmap_confidence_threshold` for score bands.
+- **Payload:** `heatmap_engine` (`context_key`, `heatmap_engine_config_version`, `float_precision_mode`, …), `heatmap_meta` (`spatial_index_mode`, `density_mode`, …), `heatmap_warnings`, extended `heatmap_confidence` (`global_score`, `cell_score_histogram`, legacy `components` keys preserved for UI/tests).
+- **Contracts:** JSON in `heatmap_interpolation_config` validated at startup; schemas under `database/schemas/heatmap_*.schema.json`. See [DATABASE.md](DATABASE.md) §2b.
 
 ### Solar, Storm, and Lightning Layers
 
@@ -500,6 +514,7 @@ The map supports multiple analytical layers that can be toggled independently:
 - Rendering: Canvas-based heatmap (similar to PM2.5 heatmap)
 - Color gradient: Yellow to orange (represents solar intensity)
 - Opacity: Configurable via `solar_layer_opacity` in `calibration_parameters` (default: 70%)
+- PM2.5 heatmap: payload includes `heatmap_confidence`, `heatmap_confidence_visual`, and `normalization_readiness`. UI shows banner + badge; heatmap opacity multiplier comes from **`heatmap_confidence_visual_mapping`** (not hardcoded in JS). See [DATABASE.md](DATABASE.md) §2b.
 
 **Storm Layer:**
 - Data source: `analytical_indices.storm_risk` (latest per city)
@@ -524,23 +539,23 @@ The map supports multiple analytical layers that can be toggled independently:
 Analytical indices are computed after weather data is saved:
 
 **Solar Index:**
-- Formula: `w1*normalize(solar_radiation) + w2*normalize(uv_index) + w3*normalize(sunshine_duration)`
-- Weights: `solar_index_radiation_weight`, `solar_index_uv_weight`, `solar_index_sunshine_weight` (from `calibration_parameters`)
+- Definition: `composite_index_definition` row `solar_index` — JSON validated against `database/schemas/composite_index_v1.schema.json` (`weighted_linear` combine, weights and `temporal_class` per input).
+- Normalization: `NormalizationEngine` + `normalization_profile` per input parameter (see `docs/DATABASE.md` §2b).
 - Range: [0, 1]
 
 **Storm Risk:**
-- Formula: `storm_risk = base_risk × cape_factor` where `cape_factor = _calculate_cape_factor(cape)`
-- Base risk: `w1*normalize(convective_precipitation) + w2*normalize(precipitation_probability) + w3*normalize(humidity) - w4*normalize(wind_speed)`
-- CAPE scaling: Piecewise linear scaling with meteorologically significant thresholds (0, 100, 1000, 2500 J/kg)
-- Parameters: `storm_risk_cape_zero_threshold`, `storm_risk_cape_weak_threshold`, `storm_risk_cape_moderate_threshold`, `storm_risk_cape_strong_threshold`, `storm_risk_cape_weak_factor`, `storm_risk_cape_moderate_factor`, `storm_risk_cape_strong_factor`, `storm_risk_cape_extreme_factor`, `storm_risk_convective_weight`, etc. (from `calibration_parameters`)
+- Formula: `storm_risk = base_risk × cape_factor` where `cape_factor` comes from `cape_piecewise_segment` (DB), not literals in Python.
+- Base risk: weighted combination of normalized inputs; weights from `calibration_parameters` (`storm_risk_*_weight`).
+- CAPE: piecewise thresholds and factors in `cape_piecewise_segment`; UI CAPE category suffix from the same table (`display_suffix_sv`) with `cape == 0` handled in the panel.
 - Range: [0, 1] (CAPE = 0 → storm_risk = 0, absolute gate - meteorologically correct)
 
 **Smog Risk:**
 - Formula: `w1*normalize(o3) + w2*normalize(solar_radiation) - w3*normalize(wind_speed)`
 - Weights: `smog_risk_o3_weight`, `smog_risk_solar_weight`, `smog_risk_wind_weight` (from `calibration_parameters`)
+- Normalization: `normalization_profile` via `NormalizationEngine`
 - Range: [0, 1]
 
-All indices are stored in `analytical_indices` table with timestamp for historical analysis.
+All indices are stored in `analytical_indices` table with timestamp for historical analysis. Full normalization trace metadata is **not** persisted per row by default; use app `debug_mode` for extended map payload (`map_debug`).
 
 ### Time Windows
 

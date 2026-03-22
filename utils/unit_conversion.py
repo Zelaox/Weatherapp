@@ -57,6 +57,7 @@ def convert_parameter_unit(
     provider_source_units = {
         "openmeteo": {
             "wind_speed": "km/h",
+            "visibility": "m",  # Open-Meteo returns meters; DB/registry typically km
         },
         "openweather": {
             "wind_speed": "m/s",
@@ -66,6 +67,10 @@ def convert_parameter_unit(
     source_unit = provider_source_units.get(provider_name, {}).get(param_name)
     if not source_unit or source_unit == target_unit:
         return raw_value
+
+    # visibility: meters → km
+    if param_name == "visibility" and source_unit == "m" and target_unit == "km":
+        return raw_value / 1000.0
 
     # Conversion factors for common wind speed units → m/s
     conversion_factors = {

@@ -1,0 +1,29 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "heatmap_radius_shrink_spec",
+  "type": "object",
+  "required": ["schema_version", "type"],
+  "properties": {
+    "schema_version": { "type": "integer", "minimum": 1 },
+    "type": { "type": "string", "enum": ["lookup", "formula"] },
+    "x_axis": { "type": "string" },
+    "points": {
+      "type": "array",
+      "items": { "type": "array", "minItems": 2, "maxItems": 2, "items": { "type": "number" } }
+    },
+    "interpolation": { "type": "string", "enum": ["linear"] },
+    "expr": { "type": "string" },
+    "params": { "type": "object" }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "type": { "const": "lookup" } } },
+      "then": { "required": ["x_axis", "points", "interpolation"] }
+    },
+    {
+      "if": { "properties": { "type": { "const": "formula" } } },
+      "then": { "required": ["expr"] }
+    }
+  ],
+  "additionalProperties": false
+}

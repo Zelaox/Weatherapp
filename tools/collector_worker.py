@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional
 
 from zoneinfo import ZoneInfo
 
-from database.db_manager import DatabaseManager
+from database.db_manager import DatabaseManager, WEATHER_DATA_EXTENDED_OPTIONAL_COLUMNS
 from providers.openaq_provider import OpenAQProvider
 from providers.openmeteo_provider import OpenMeteoProvider
 from utils.config_loader import ConfigLoader
@@ -158,7 +158,7 @@ class CollectorWorker:
                 pollutants = aq_result.get("pollutants", {}) or {}
                 pollutant_measurement_timestamp = aq_result.get("measurement_timestamp")
 
-        if (not pollutants) and self._openmeteo:
+        if (not pollutants) and self._openmeteo and self._openmeteo.is_available():
             om_aq_result = self._openmeteo.get_air_quality(lat, lon)
             if om_aq_result and isinstance(om_aq_result, dict):
                 pollutants = om_aq_result.get("pollutants", {}) or {}
@@ -189,12 +189,24 @@ class CollectorWorker:
             precip_prob = weather_data.get("precipitation_probability")
             conv_precip = weather_data.get("convective_precipitation")
 
-            pm25 = pollutants.get("pm25")
-            pm10 = pollutants.get("pm10")
-            no2 = pollutants.get("no2")
-            o3 = pollutants.get("o3")
+            def _poll(name: str) -> Optional[float]:
+                v = pollutants.get(name)
+                if v is not None:
+                    return v
+                return weather_data.get(name)
+
+            pm25 = _poll("pm25")
+            pm10 = _poll("pm10")
+            no2 = _poll("no2")
+            o3 = _poll("o3")
 
             measurement_timestamp = pollutant_measurement_timestamp or weather_data.get("measurement_timestamp")
+
+            ext_kw = {
+                k: weather_data[k]
+                for k in WEATHER_DATA_EXTENDED_OPTIONAL_COLUMNS
+                if k in weather_data and weather_data[k] is not None
+            }
 
             self.logger.info(
                 f"CollectorWorker: sparar data för {name} (source={source}, "
@@ -221,6 +233,7 @@ class CollectorWorker:
                 cape=cape,
                 precipitation_probability=precip_prob,
                 convective_precipitation=conv_precip,
+                **ext_kw,
             )
 
             if data_id and data_id > 0:

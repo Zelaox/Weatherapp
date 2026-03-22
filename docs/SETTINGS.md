@@ -131,6 +131,13 @@ controller.restart_auto_update = lambda minutes: (
 
 ---
 
+## See also
+
+- [DATABASE.md](DATABASE.md) — SQLite, `parameter_registry`, wind units  
+- [ANALYTICAL_MAP.md](ANALYTICAL_MAP.md) — Stations tab map architecture
+
+---
+
 ## Version History
 
 | Version | Date | Change |

@@ -1,9 +1,9 @@
 """Main weather controller (MVC pattern)."""
 
 import threading
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 from PyQt5.QtCore import QObject, pyqtSignal
-from database.db_manager import DatabaseManager
+from database.db_manager import DatabaseManager, WEATHER_DATA_EXTENDED_OPTIONAL_COLUMNS
 from utils.config_loader import ConfigLoader
 from utils.logger import WeatherLogger
 from providers.openmeteo_provider import OpenMeteoProvider
@@ -14,6 +14,17 @@ from analytics.derived_metrics import DerivedMetricsCalculator, ANALYTICAL_INPUT
 from utils.parameter_formatter import format_parameter_name
 from pathlib import Path
 from utils import log_analyzer
+
+
+def _extended_weather_field_kwargs(data: Optional[Dict]) -> Dict:
+    """Non-None extended columns present on provider dict (matches weather_data schema)."""
+    if not data:
+        return {}
+    return {
+        k: data[k]
+        for k in WEATHER_DATA_EXTENDED_OPTIONAL_COLUMNS
+        if k in data and data[k] is not None
+    }
 
 
 class WeatherController(QObject):
@@ -149,6 +160,24 @@ class WeatherController(QObject):
     def get_city_weather(self, city_id: int) -> Optional[Dict]:
         """Get latest weather for a city."""
         return self.db.get_latest_weather(city_id)
+
+    def get_pm25_for_city_or_nearest(
+        self, city_id: int, hours: int = 24
+    ) -> Tuple[Optional[float], Optional[str], Optional[float]]:
+        """
+        Get PM2.5 value for a city: own 24h average if available, else nearest station within radius.
+        Returns (value, source_label, distance_km). source_label is e.g. "Göteborg (42 km)" when fallback is used.
+        """
+        value, src_id, src_name, dist_km = self.db.get_parameter_for_city_or_nearest(
+            city_id, "pm25", hours=hours
+        )
+        if value is None:
+            return (None, None, None)
+        if dist_km is not None and dist_km > 0 and src_name:
+            source_label = f"{src_name} ({dist_km:.0f} km)"
+        else:
+            source_label = None
+        return (value, source_label, dist_km)
     
     def update_all_cities(self):
         """Update weather for all cities."""
@@ -326,8 +355,14 @@ class WeatherController(QObject):
                 except Exception as e:
                     self.logger.debug(f"OpenAQ misslyckades för {city_name}: {e}")
             
-            # Try OpenMeteo if OpenAQ didn't provide data
-            if (pm25 is None and pm10 is None and no2 is None and o3 is None) and self.openmeteo and lat is not None and lon is not None:
+            # Try OpenMeteo if OpenAQ didn't provide data (endast om Open-Meteo inte är pausad/kvot)
+            if (
+                (pm25 is None and pm10 is None and no2 is None and o3 is None)
+                and self.openmeteo
+                and self.openmeteo.is_available()
+                and lat is not None
+                and lon is not None
+            ):
                 try:
                     air_quality_result = self.openmeteo.get_air_quality(lat, lon)
                     if air_quality_result and isinstance(air_quality_result, dict):
@@ -416,7 +451,8 @@ class WeatherController(QObject):
             sunshine_duration=sunshine_duration,
             cape=cape,
             precipitation_probability=precipitation_probability,
-            convective_precipitation=convective_precipitation
+            convective_precipitation=convective_precipitation,
+            **_extended_weather_field_kwargs(data),
         )
         
         if data_id and data_id > 0:
@@ -527,8 +563,14 @@ class WeatherController(QObject):
                     is_available = False
                 
                 if not is_available:
+                    # Open-Meteo: is_available() False = t.ex. daglig API-kvot — anropa inte get_air_quality.
+                    if provider_name == "openmeteo":
+                        self.logger.info(
+                            f"{provider_name} är inte tillgänglig — hoppar pollutant-anrop (ingen Open-Meteo-kvot / paus)"
+                        )
+                        continue
                     self.logger.info(f"{provider_name} är inte tillgänglig, försöker hämta pollutant-data ändå...")
-                    # Try to get pollutants separately even if provider reports unavailable
+                    # Try to get pollutants separately even if provider reports unavailable (t.ex. OpenAQ)
                     try:
                         # Get max age from calibration parameters (used only for OpenAQ)
                         max_age_hours = self.db.get_calibration_parameter('openaq_max_data_age_hours')
@@ -595,87 +637,101 @@ class WeatherController(QObject):
                         # Also try get_air_quality separately for pollutants
                         # NOTE: This may cause duplicate API calls if get_current_weather() already calls get_air_quality()
                         # We should check if get_current_weather() already returned pollutants before calling this
-                        try:
-                            self.logger.info(f"[DEBUG] Anropar {provider_name}.get_air_quality() separat för {city_name}")
-                            # Get max age from calibration parameters (used only for OpenAQ)
-                            max_age_hours = self.db.get_calibration_parameter('openaq_max_data_age_hours')
-                            if max_age_hours is None:
-                                max_age_hours = 48.0  # Default: 48 hours
-                            else:
-                                max_age_hours = float(max_age_hours)
-                            
-                            if provider_name == "openaq":
-                                self.logger.info(f"[API] Anropar {provider_name}.get_air_quality({lat:.2f}, {lon:.2f}, max_age_hours={max_age_hours}) för {city_name}")
-                                air_quality_result = provider.get_air_quality(lat, lon, max_age_hours=max_age_hours)
-                            else:
-                                self.logger.info(f"[API] Anropar {provider_name}.get_air_quality({lat:.2f}, {lon:.2f}) för {city_name}")
-                                air_quality_result = provider.get_air_quality(lat, lon)
-                            if air_quality_result and isinstance(air_quality_result, dict):
-                                pollutants = air_quality_result.get("pollutants", {})
-                                self.logger.info(f"[API] {provider_name} returnerade pollutants: {pollutants}")
-                                # Extract measurement timestamp if available
-                                if pollutant_measurement_timestamp is None:
-                                    pollutant_measurement_timestamp = air_quality_result.get("measurement_timestamp")
-                                    if pollutant_measurement_timestamp:
-                                        self.logger.info(f"[API] {provider_name} measurement_timestamp: {pollutant_measurement_timestamp}")
+                        if provider_name == "openmeteo" and not provider.is_available():
+                            self.logger.debug(
+                                f"{provider_name}: hoppar separat get_air_quality (ej tillgänglig efter väderanrop / kvot)"
+                            )
+                        else:
+                            try:
+                                self.logger.info(f"[DEBUG] Anropar {provider_name}.get_air_quality() separat för {city_name}")
+                                # Get max age from calibration parameters (used only for OpenAQ)
+                                max_age_hours = self.db.get_calibration_parameter('openaq_max_data_age_hours')
+                                if max_age_hours is None:
+                                    max_age_hours = 48.0  # Default: 48 hours
+                                else:
+                                    max_age_hours = float(max_age_hours)
                                 
-                                # Save sensors to database if OpenAQ returned sensor data
-                                if provider_name == "openaq" and "sensors" in air_quality_result:
-                                    sensors_data = air_quality_result.get("sensors", [])
-                                    if sensors_data:
-                                        self.logger.info(f"[API] OpenAQ: Sparar {len(sensors_data)} sensorer för {city_name}")
-                                        for sensor in sensors_data:
-                                            try:
-                                                sensor_id = sensor.get("sensor_id")
-                                                parameter = sensor.get("parameter")
-                                                coords = sensor.get("coordinates", {})
-                                                sensor_lat = coords.get("latitude")
-                                                sensor_lon = coords.get("longitude")
-                                                value = sensor.get("value")
-                                                
-                                                if sensor_id and sensor_lat is not None and sensor_lon is not None:
-                                                    # Format parameter name dynamically (no hardcoded IDs)
-                                                    # Parameter can be int (ID) or string (name) from API
-                                                    if isinstance(parameter, int):
-                                                        # If parameter is an ID, we can't format it without name
-                                                        # Use the parameter value as-is and let formatter handle it
-                                                        param_name = format_parameter_name(str(parameter))
-                                                    else:
-                                                        # Parameter is already a name string from API
-                                                        param_name = format_parameter_name(str(parameter))
+                                if provider_name == "openaq":
+                                    self.logger.info(f"[API] Anropar {provider_name}.get_air_quality({lat:.2f}, {lon:.2f}, max_age_hours={max_age_hours}) för {city_name}")
+                                    air_quality_result = provider.get_air_quality(lat, lon, max_age_hours=max_age_hours)
+                                else:
+                                    self.logger.info(f"[API] Anropar {provider_name}.get_air_quality({lat:.2f}, {lon:.2f}) för {city_name}")
+                                    air_quality_result = provider.get_air_quality(lat, lon)
+                                if air_quality_result and isinstance(air_quality_result, dict):
+                                    pollutants = air_quality_result.get("pollutants", {})
+                                    self.logger.info(f"[API] {provider_name} returnerade pollutants: {pollutants}")
+                                    # Extract measurement timestamp if available
+                                    if pollutant_measurement_timestamp is None:
+                                        pollutant_measurement_timestamp = air_quality_result.get("measurement_timestamp")
+                                        if pollutant_measurement_timestamp:
+                                            self.logger.info(f"[API] {provider_name} measurement_timestamp: {pollutant_measurement_timestamp}")
+                                    
+                                    # Save sensors to database if OpenAQ returned sensor data
+                                    if provider_name == "openaq" and "sensors" in air_quality_result:
+                                        sensors_data = air_quality_result.get("sensors", [])
+                                        if sensors_data:
+                                            self.logger.info(f"[API] OpenAQ: Sparar {len(sensors_data)} sensorer för {city_name}")
+                                            for sensor in sensors_data:
+                                                try:
+                                                    sensor_id = sensor.get("sensor_id")
+                                                    parameter = sensor.get("parameter")
+                                                    coords = sensor.get("coordinates", {})
+                                                    sensor_lat = coords.get("latitude")
+                                                    sensor_lon = coords.get("longitude")
+                                                    value = sensor.get("value")
                                                     
-                                                    self.db.add_sensor(
-                                                        city_id=city_id,
-                                                        sensor_id=sensor_id,
-                                                        parameter=param_name,
-                                                        latitude=sensor_lat,
-                                                        longitude=sensor_lon,
-                                                        last_value=value,
-                                                        last_updated=pollutant_measurement_timestamp,
-                                                        is_custom=0,
-                                                        custom_info=None
-                                                    )
-                                                    self.logger.debug(f"Sparade sensor {sensor_id} ({param_name}) för {city_name}")
-                                            except Exception as sensor_err:
-                                                self.logger.warning(f"Fel vid sparande av sensor för {city_name}: {sensor_err}")
-                                
-                                # Merge pollutants (keep best available value for each parameter)
-                                # Use dynamic parameter list from merged_pollutants keys
-                                for param in merged_pollutants.keys():
-                                    if pollutants.get(param) is not None:
-                                        # Use value if we don't have one
-                                        if merged_pollutants[param] is None:
-                                            merged_pollutants[param] = pollutants.get(param)
-                                            self.logger.info(f"[API] {provider_name}: ✓ Fick {param}={pollutants.get(param)} separat")
+                                                    if sensor_id and sensor_lat is not None and sensor_lon is not None:
+                                                        # Format parameter name dynamically (no hardcoded IDs)
+                                                        # Parameter can be int (ID) or string (name) from API
+                                                        if isinstance(parameter, int):
+                                                            # If parameter is an ID, we can't format it without name
+                                                            # Use the parameter value as-is and let formatter handle it
+                                                            param_name = format_parameter_name(str(parameter))
+                                                        else:
+                                                            # Parameter is already a name string from API
+                                                            param_name = format_parameter_name(str(parameter))
+                                                        
+                                                        self.db.add_sensor(
+                                                            city_id=city_id,
+                                                            sensor_id=sensor_id,
+                                                            parameter=param_name,
+                                                            latitude=sensor_lat,
+                                                            longitude=sensor_lon,
+                                                            last_value=value,
+                                                            last_updated=pollutant_measurement_timestamp,
+                                                            is_custom=0,
+                                                            custom_info=None
+                                                        )
+                                                        self.logger.debug(f"Sparade sensor {sensor_id} ({param_name}) för {city_name}")
+                                                except Exception as sensor_err:
+                                                    self.logger.warning(f"Fel vid sparande av sensor för {city_name}: {sensor_err}")
+                                    
+                                    # Merge pollutants (keep best available value for each parameter)
+                                    # Use dynamic parameter list from merged_pollutants keys
+                                    for param in merged_pollutants.keys():
+                                        if pollutants.get(param) is not None:
+                                            # Use value if we don't have one
+                                            if merged_pollutants[param] is None:
+                                                merged_pollutants[param] = pollutants.get(param)
+                                                self.logger.info(f"[API] {provider_name}: ✓ Fick {param}={pollutants.get(param)} separat")
+                                            else:
+                                                self.logger.debug(f"[API] {provider_name}: {param} redan satt ({merged_pollutants[param]}), hoppar över")
                                         else:
-                                            self.logger.debug(f"[API] {provider_name}: {param} redan satt ({merged_pollutants[param]}), hoppar över")
-                                    else:
-                                        self.logger.debug(f"[API] {provider_name}: {param} är None i pollutants dict")
-                        except Exception as poll_err:
-                            self.logger.info(f"{provider_name}: Fel vid separat pollutant-hämtning: {poll_err}")
+                                            self.logger.debug(f"[API] {provider_name}: {param} är None i pollutants dict")
+                            except Exception as poll_err:
+                                self.logger.info(f"{provider_name}: Fel vid separat pollutant-hämtning: {poll_err}")
                 except Exception as weather_error:
                     error_msg = str(weather_error)
                     self.logger.info(f"{provider_name}: Fel vid hämtning av väderdata: {error_msg}")
+                    if provider_name == "openmeteo":
+                        try:
+                            if not provider.is_available():
+                                self.logger.debug(
+                                    f"{provider_name}: hoppar pollutant-fallback (ej tillgänglig / kvot)"
+                                )
+                                continue
+                        except Exception:
+                            pass
                     # Try to get pollutants separately as fallback
                     try:
                         # Get max age from calibration parameters (used only for OpenAQ)
@@ -927,7 +983,8 @@ class WeatherController(QObject):
                             # Storm parameters
                             cape=cape,
                             precipitation_probability=precipitation_probability,
-                            convective_precipitation=convective_precipitation
+                            convective_precipitation=convective_precipitation,
+                            **_extended_weather_field_kwargs(weather_data),
                         )
                     else:
                         # Save only weather data (no pollutants) with collector timestamp (current time)
@@ -952,7 +1009,8 @@ class WeatherController(QObject):
                             # Storm parameters
                             cape=cape,
                             precipitation_probability=precipitation_probability,
-                            convective_precipitation=convective_precipitation
+                            convective_precipitation=convective_precipitation,
+                            **_extended_weather_field_kwargs(weather_data),
                         )
                     
                     # Emit signal if data was successfully saved (data_id > 0)

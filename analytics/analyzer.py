@@ -209,7 +209,7 @@ class WeatherAnalyzer:
                 if weather.get('pm25') is not None:
                     city_id = weather.get('city_id')
                     if city_id:
-                        pm25_24h = self.db.get_24h_rolling_average(city_id, 'pm25')
+                        pm25_24h = self.db.get_parameter_for_city_or_nearest(city_id, 'pm25', hours=24)[0]
                         if pm25_24h is not None:
                             pm25_24h_averages.append(pm25_24h)
             
@@ -265,7 +265,7 @@ class WeatherAnalyzer:
             
             for city in all_cities:
                 # Get 24h rolling average PM2.5
-                pm25_avg = self.db.get_24h_rolling_average(city['id'], 'pm25')
+                pm25_avg = self.db.get_parameter_for_city_or_nearest(city['id'], 'pm25', hours=24)[0]
                 if pm25_avg is not None:
                     pm25_averages.append(pm25_avg)
                     cities_with_data += 1
@@ -339,7 +339,7 @@ class WeatherAnalyzer:
         city_data = []
         
         for city in cities:
-            pm25_avg = self.db.get_24h_rolling_average(city['id'], 'pm25')
+            pm25_avg = self.db.get_parameter_for_city_or_nearest(city['id'], 'pm25', hours=24)[0]
             if pm25_avg is not None:
                 level = self.warning_detector.get_warning_level(pm25_avg)
                 from utils.aqi_calculator import calculate_aqi_from_pm25_24h

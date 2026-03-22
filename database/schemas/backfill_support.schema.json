@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://weatherapp.local/schemas/backfill_support.schema.json",
+  "title": "BackfillSupport",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["archive", "forecast", "realtime", "endpoint_profile"],
+  "properties": {
+    "archive": {
+      "type": "boolean",
+      "description": "Whether Open-Meteo archive backfill may request this parameter"
+    },
+    "forecast": {
+      "type": "boolean",
+      "description": "Whether forecast API may request this parameter"
+    },
+    "realtime": {
+      "type": "boolean",
+      "description": "Whether realtime/current ingestion may use this parameter"
+    },
+    "endpoint_profile": {
+      "type": "string",
+      "enum": ["forecast-api", "archive-api", "any"],
+      "description": "Primary Open-Meteo endpoint contract for this parameter"
+    }
+  }
+}

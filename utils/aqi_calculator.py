@@ -77,13 +77,13 @@ def get_current_aqi(db_manager: DatabaseManager, city_id: int) -> Optional[float
         AQI value (calculated from 24h avg PM2.5, or PM10 if PM2.5 unavailable)
         None if insufficient data
     """
-    # Try PM2.5 first (preferred)
-    pm25_avg = db_manager.get_24h_rolling_average(city_id, 'pm25')
+    # Try PM2.5 first (preferred; own or nearest-station fallback)
+    pm25_avg = db_manager.get_parameter_for_city_or_nearest(city_id, 'pm25', hours=24)[0]
     if pm25_avg is not None:
         return calculate_aqi_from_pm25_24h(pm25_avg)
-    
-    # Fallback to PM10
-    pm10_avg = db_manager.get_24h_rolling_average(city_id, 'pm10')
+
+    # Fallback to PM10 (own or nearest-station fallback)
+    pm10_avg = db_manager.get_parameter_for_city_or_nearest(city_id, 'pm10', hours=24)[0]
     if pm10_avg is not None:
         return calculate_aqi_from_pm10_24h(pm10_avg)
     

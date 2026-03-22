@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "normalization_profile_row",
+  "title": "normalization_profile (optional config_json extension)",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "mode": {
+      "type": "string",
+      "enum": ["winsorized_percentile", "fixed_domain", "identity"]
+    },
+    "p_low": { "type": "number", "minimum": 0, "maximum": 100 },
+    "p_high": { "type": "number", "minimum": 0, "maximum": 100 },
+    "history_days": { "type": ["number", "null"] },
+    "fixed_min": { "type": "number" },
+    "fixed_max": { "type": "number" }
+  },
+  "required": ["mode"]
+}

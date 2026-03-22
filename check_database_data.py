@@ -99,7 +99,7 @@ def check_database_data():
         # Check for 24h rolling average data (PM2.5)
         print("\n24h rolling average check:")
         try:
-            pm25_24h = db.get_24h_rolling_average(city_id, 'pm25')
+            pm25_24h = db.get_parameter_for_city_or_nearest(city_id, 'pm25', hours=24)[0]
             if pm25_24h is not None:
                 print(f"  [OK] PM2.5 (24h average): {pm25_24h:.2f} µg/m³")
             else:

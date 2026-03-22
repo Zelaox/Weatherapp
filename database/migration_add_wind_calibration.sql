@@ -1,5 +1,5 @@
 -- Wind unit and validation calibration (no hardcoded thresholds in code).
--- See docs/TECH_NOTE_WIND_FLOW.md for end-to-end wind flow.
+-- See docs/DATABASE.md (section 3) for end-to-end wind flow.
 
 INSERT OR IGNORE INTO calibration_parameters (key, value, unit, description, source) VALUES
     ('wind_speed_warning_threshold_mps', 15.0, 'm/s', 'Threshold above which analytics logs "orimligt höga vindhastigheter"', 'migration_add_wind_calibration.sql'),

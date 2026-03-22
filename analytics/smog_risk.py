@@ -8,6 +8,7 @@ from typing import Optional
 import logging
 
 from database.db_manager import DatabaseManager
+from analytics.normalization_engine import NormalizationEngine
 
 
 logger = logging.getLogger("WeatherApp.analytics.smog_risk")
@@ -18,26 +19,14 @@ class SmogRiskCalculator:
 
     def __init__(self, db: DatabaseManager):
         self._db = db
+        self._norm = NormalizationEngine(db)
 
     def _normalize(self, value: Optional[float], parameter: str) -> Optional[float]:
-        """Normalize value to [0, 1] using winsorized bounds."""
+        """Normalize value to [0, 1] using normalization_profile."""
         if value is None:
             return None
-
-        bounds = self._db.get_parameter_winsorized_bounds(parameter, 5.0, 95.0)
-        if not bounds or bounds[0] is None or bounds[1] is None:
-            logger.debug(
-                "SmogRisk: no winsorized bounds for %s, cannot normalize", parameter
-            )
-            return None
-
-        lo, hi = bounds
-        if hi <= lo:
-            logger.warning("SmogRisk: invalid bounds for %s: lo=%s hi=%s", parameter, lo, hi)
-            return None
-
-        norm = (value - lo) / (hi - lo)
-        return max(0.0, min(1.0, norm))
+        out, _ = self._norm.normalize(parameter, value, debug_trace=False)
+        return out
 
     def calculate(self, city_id: int) -> Optional[float]:
         """Calculate smog_risk in [0, 1] for the given city."""

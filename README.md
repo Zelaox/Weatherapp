@@ -64,6 +64,7 @@ Applikationen använder tre gratis API-källor för redundans och komplett data:
 - **24-timmars rullande medelvärden** för AQI-beräkning
 - **Intelligent lagring**: Undviker duplicering baserat på measurement timestamps från API:er
 - **Sensor-hantering**: Lagrar OpenAQ sensor-ID, koordinater och senaste värden
+- **Parameter registry & metadata** (källsanning, Open-Meteo-grupper, vind-enheter): se [docs/DATABASE.md](docs/DATABASE.md)
 
 ### GUI
 - **PyQt5** för användargränssnitt

@@ -9,6 +9,11 @@ from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 import logging
 
+try:
+    _PANDAS_VERSION = tuple(int(x) for x in pd.__version__.split(".")[:2])
+except Exception:
+    _PANDAS_VERSION = (0, 0)
+
 # Matplotlib imports
 # Backend is set in main.py before any imports
 from matplotlib.figure import Figure
@@ -56,7 +61,61 @@ class GraphGenerator:
         # Replace invalid characters: / < > : " | ? * with underscore
         sanitized = re.sub(r'[<>:"|?*/]', '_', name)
         return sanitized
-    
+
+    def _parse_timestamp_column(
+        self,
+        df: pd.DataFrame,
+        column_name: str,
+        logger_context: str,
+    ) -> Tuple[pd.Series, int]:
+        """
+        Parse a timestamp column robustly (mixed formats, numeric Unix s/ms).
+        No hardcoded date format strings; data-driven parsing only.
+
+        Returns:
+            (parsed_series, count_still_nat)
+        """
+        series = df[column_name]
+        parsed = pd.Series(index=series.index, dtype="datetime64[ns]")
+        num_nat = 0
+
+        if _PANDAS_VERSION >= (2, 0):
+            try:
+                parsed = pd.to_datetime(
+                    series, format="mixed", errors="coerce", utc=False
+                )
+            except TypeError:
+                parsed = pd.to_datetime(series, errors="coerce", utc=False)
+        else:
+            parsed = pd.to_datetime(series, errors="coerce", utc=False)
+
+        still_nat = parsed.isna()
+        if still_nat.any():
+            raw = series[still_nat]
+            numeric = pd.to_numeric(raw, errors="coerce")
+            ok = numeric.notna()
+            if ok.any():
+                converted = pd.to_datetime(numeric[ok], unit="s", errors="coerce")
+                parsed = parsed.copy()
+                parsed.update(converted)
+            still_nat = parsed.isna()
+            if still_nat.any():
+                raw = series[still_nat]
+                numeric = pd.to_numeric(raw, errors="coerce")
+                ok = numeric.notna()
+                if ok.any():
+                    converted = pd.to_datetime(numeric[ok], unit="ms", errors="coerce")
+                    parsed = parsed.copy()
+                    parsed.update(converted)
+
+        num_nat = int(parsed.isna().sum())
+        if num_nat > 0 and logger_context:
+            first_fail = series[parsed.isna()].iloc[0]
+            logger.debug(
+                f"Timestamp parsing {logger_context}: first unparseable value: {first_fail!r} (type={type(first_fail).__name__})"
+            )
+        return parsed, num_nat
+
     def _get_export_timestamp(self) -> str:
         """
         Get current timestamp for export filename (CET timezone).
@@ -217,7 +276,57 @@ class GraphGenerator:
         # Create canvas and save
         canvas = FigureCanvasAgg(figure)
         canvas.print_figure(str(filepath), dpi=style['dpi'], bbox_inches='tight')
-    
+
+    def _export_placeholder_for_city(
+        self,
+        city_name: str,
+        selected_date: date,
+        export_timestamp: str,
+        mode: Optional[BaseMode],
+        category: Optional[str],
+    ) -> Optional[str]:
+        """
+        Export a placeholder PNG for a city that has no data for the selected date.
+        Keeps one-file-per-city for date-based exports (e.g. Daily).
+        """
+        try:
+            style = self._get_plot_style_params()
+            fig = Figure(facecolor='white')
+            ax = fig.add_subplot(111)
+            ax.set_axis_off()
+            ax.text(
+                0.5, 0.5,
+                f"{city_name}\nIngen data för {selected_date.isoformat()}",
+                transform=ax.transAxes,
+                fontsize=style.get('fontsize_title', 10) or 10,
+                ha='center',
+                va='center',
+                wrap=True,
+            )
+            sanitized = self._sanitize_filename(city_name)
+            filename = f"{sanitized}_{export_timestamp}.png"
+            if category:
+                category_dir = self.output_dir / category
+                category_dir.mkdir(parents=True, exist_ok=True)
+                if mode:
+                    mode_dir = category_dir / mode.get_name()
+                    mode_dir.mkdir(parents=True, exist_ok=True)
+                    filepath = mode_dir / filename
+                else:
+                    filepath = category_dir / filename
+            elif mode:
+                mode_dir = self.output_dir / mode.get_name()
+                mode_dir.mkdir(parents=True, exist_ok=True)
+                filepath = mode_dir / filename
+            else:
+                filepath = self.output_dir / filename
+            self._export_matplotlib_figure(fig, filepath, style)
+            logger.debug(f"Placeholder export för {city_name}: {filepath}")
+            return str(filepath)
+        except Exception as e:
+            logger.warning(f"Kunde inte skapa placeholder för {city_name}: {e}")
+            return None
+
     def _create_matplotlib_default_plot(
         self,
         df: pd.DataFrame,
@@ -519,11 +628,15 @@ class GraphGenerator:
                 # Log data statistics for debugging
                 logger.info(f"[DATA CHECK] {city_name} - {param.upper()} (DailyMode): count={value_count}, unique={unique_values}, std={value_std:.4f}, min={values.min():.2f}, max={values.max():.2f}")
                 
-                # Warn if constant data detected
+                # Log constant/near-constant data at DEBUG only (e.g. SUNSHINE_DURATION=0 at night is valid)
                 if unique_values == 1:
-                    logger.warning(f"⚠️ KONSTANT DATA UPPTÄCKT: {city_name} - {param.upper()} (DailyMode) har endast ett unikt värde ({values.iloc[0]:.2f}) över {value_count} timmar. Detta är INTE en riktig tidsserie!")
+                    logger.debug(
+                        f"Constant data: {city_name} - {param.upper()} (DailyMode) single value {values.iloc[0]:.2f} over {value_count} hours"
+                    )
                 elif value_std < 0.01:
-                    logger.warning(f"⚠️ MISSTÄNKT KONSTANT DATA: {city_name} - {param.upper()} (DailyMode) har mycket låg variation (std={value_std:.4f}) över {value_count} timmar. Kontrollera datakällan.")
+                    logger.debug(
+                        f"Low variation: {city_name} - {param.upper()} (DailyMode) std={value_std:.4f} over {value_count} hours"
+                    )
                 
                 # Hours are the index (0-23)
                 hours = values.index.tolist()
@@ -743,14 +856,19 @@ class GraphGenerator:
                 logger.warning(f"Inga timestamp-kolumn i lightning events för stad {city_name}")
                 return None
 
-            # Konvertera timestamp till datetime och CET
             try:
-                df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce", utc=False)
-                df = df[df["timestamp"].notna()]
+                parsed, num_failed = self._parse_timestamp_column(
+                    df, "timestamp", logger_context=f"lightning events {city_name}"
+                )
+                df["timestamp"] = parsed
+                if num_failed > 0:
+                    logger.warning(
+                        f"Kunde inte parsa {num_failed} timestamp(s) i lightning events för stad {city_name}, hoppar över dessa rader"
+                    )
+                    df = df[df["timestamp"].notna()]
                 if df.empty:
                     logger.info(f"Inga giltiga tidsstämplar i lightning events för stad {city_name}")
                     return None
-
                 if df["timestamp"].dt.tz is None:
                     df["timestamp"] = df["timestamp"].dt.tz_localize(CET)
                 elif df["timestamp"].dt.tz != CET:
@@ -853,34 +971,29 @@ class GraphGenerator:
         # Convert timestamp to datetime and ensure timezone-aware (CET)
         if 'timestamp' in df.columns:
             try:
-                # Use pd.to_datetime with errors='coerce' to handle problematic timestamps gracefully
-                # This handles timezone-aware strings like "2026-02-19 18:15:00+01:00"
-                df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce', utc=False)
-                
-                # Drop rows where timestamp parsing failed (NaT)
-                if df['timestamp'].isna().any():
-                    num_failed = df['timestamp'].isna().sum()
-                    logger.warning(f"Kunde inte parsa {num_failed} timestamp(s) för stad {city_name}, hoppar över dessa rader")
+                parsed, num_failed = self._parse_timestamp_column(
+                    df, 'timestamp', logger_context=city_name
+                )
+                df['timestamp'] = parsed
+                if num_failed > 0:
+                    logger.warning(
+                        f"Kunde inte parsa {num_failed} timestamp(s) för stad {city_name}, hoppar över dessa rader"
+                    )
                     df = df[df['timestamp'].notna()]
-                
                 if df.empty:
                     logger.info(f"Ingen giltig data efter timestamp-parsing för stad {city_name}")
                     return None
-                
-                # Ensure timezone-aware (CET)
                 if df['timestamp'].dt.tz is None:
-                    # Naive datetime - localize to CET
                     df['timestamp'] = df['timestamp'].dt.tz_localize(CET)
                 elif df['timestamp'].dt.tz != CET:
-                    # Different timezone - convert to CET
                     df['timestamp'] = df['timestamp'].dt.tz_convert(CET)
             except Exception as e:
                 logger.error(f"Fel vid timestamp-konvertering för stad {city_name}: {e}")
                 return None
-        
+
         # Get style parameters
         style = self._get_plot_style_params()
-        
+
         # Use mode if provided, otherwise default behavior
         if mode is not None:
             widget = self._generate_plot_with_mode(df, mode, city_name, available_params, selected_date)
@@ -951,22 +1064,32 @@ class GraphGenerator:
         Returns:
             Tuple of (list of file paths, export_timestamp used)
         """
-        logger.info(f"Genererar grafer för alla städer, hours={hours}, mode={mode}, selected_date={selected_date}, category={category}")
-        
         # Get all cities dynamically
         cities = self.db.get_all_cities()
-        
+        num_cities = len(cities)
+        logger.info(
+            f"Genererar grafer för alla städer: {num_cities} städer, hours={hours}, mode={mode}, selected_date={selected_date}, category={category}"
+        )
+
         if not cities:
             logger.warning("Inga städer hittades")
             return ([], export_timestamp or self._get_export_timestamp())
-        
+
         # Generate export timestamp (global for all graphs in this batch)
         if export_timestamp is None:
             export_timestamp = self._get_export_timestamp()
-        
+
+        # When using a date-based mode (e.g. Daily), export one file per city: real graph or placeholder
+        export_placeholders = (
+            mode is not None
+            and mode.needs_date_selection()
+            and selected_date is not None
+        )
+
         filepaths = []
         for city in cities:
             city_id = city['id']
+            city_name = city.get('name', 'Unknown')
             filepath = self.generate_city_graph(
                 city_id,
                 hours=hours,
@@ -977,8 +1100,21 @@ class GraphGenerator:
             )
             if filepath:
                 filepaths.append(filepath)
-        
-        logger.info(f"Genererade {len(filepaths)} stadsgrafer")
+            elif export_placeholders:
+                # One export per city: add placeholder for "no data for this date"
+                placeholder_path = self._export_placeholder_for_city(
+                    city_name, selected_date, export_timestamp, mode, category
+                )
+                if placeholder_path:
+                    filepaths.append(placeholder_path)
+
+        skipped = num_cities - len(filepaths)
+        if skipped > 0 and selected_date is not None and not export_placeholders:
+            logger.info(
+                f"Genererade {len(filepaths)} stadsgrafer; {skipped} städer hoppades över (ingen data för valt datum {selected_date})"
+            )
+        else:
+            logger.info(f"Genererade {len(filepaths)} stadsgrafer (av {num_cities} städer)")
         return (filepaths, export_timestamp)
     
     def generate_category_graphs(
@@ -1059,12 +1195,18 @@ class GraphGenerator:
                 return None
 
             try:
-                df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce", utc=False)
-                df = df[df["timestamp"].notna()]
+                parsed, num_failed = self._parse_timestamp_column(
+                    df, "timestamp", logger_context="lightning events nationell graf"
+                )
+                df["timestamp"] = parsed
+                if num_failed > 0:
+                    logger.warning(
+                        f"Kunde inte parsa {num_failed} timestamp(s) i lightning events för nationell graf, hoppar över dessa rader"
+                    )
+                    df = df[df["timestamp"].notna()]
                 if df.empty:
                     logger.info("Inga giltiga tidsstämplar i lightning events för nationell graf")
                     return None
-
                 if df["timestamp"].dt.tz is None:
                     df["timestamp"] = df["timestamp"].dt.tz_localize(CET)
                 elif df["timestamp"].dt.tz != CET:
@@ -1116,31 +1258,26 @@ class GraphGenerator:
         # Convert timestamp to datetime and ensure timezone-aware (CET)
         if 'timestamp' in df.columns:
             try:
-                # Use pd.to_datetime with errors='coerce' to handle problematic timestamps gracefully
-                # This handles timezone-aware strings like "2026-02-19 18:15:00+01:00"
-                df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce', utc=False)
-                
-                # Drop rows where timestamp parsing failed (NaT)
-                if df['timestamp'].isna().any():
-                    num_failed = df['timestamp'].isna().sum()
-                    logger.warning(f"Kunde inte parsa {num_failed} timestamp(s) för nationell graf, hoppar över dessa rader")
+                parsed, num_failed = self._parse_timestamp_column(
+                    df, 'timestamp', logger_context="nationell graf"
+                )
+                df['timestamp'] = parsed
+                if num_failed > 0:
+                    logger.warning(
+                        f"Kunde inte parsa {num_failed} timestamp(s) för nationell graf, hoppar över dessa rader"
+                    )
                     df = df[df['timestamp'].notna()]
-                
                 if df.empty:
                     logger.info("Ingen giltig data efter timestamp-parsing för nationell graf")
                     return None
-                
-                # Ensure timezone-aware (CET)
                 if df['timestamp'].dt.tz is None:
-                    # Naive datetime - localize to CET
                     df['timestamp'] = df['timestamp'].dt.tz_localize(CET)
                 elif df['timestamp'].dt.tz != CET:
-                    # Different timezone - convert to CET
                     df['timestamp'] = df['timestamp'].dt.tz_convert(CET)
             except Exception as e:
                 logger.error(f"Fel vid timestamp-konvertering för nationell graf: {e}")
                 return None
-        
+
         # Filter by timestamp if hours specified (time-based, not datapoint-based)
         if hours is not None:
             cutoff_time = datetime.now(CET) - pd.Timedelta(hours=hours)

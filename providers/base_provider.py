@@ -1,4 +1,9 @@
-"""Base provider interface for weather APIs."""
+"""Base provider interface for weather APIs.
+
+Providers only write real measurements (add_weather_data for cities they actually fetch).
+Nearest-station fallback is applied at read time via DatabaseManager.get_parameter_for_city_or_nearest;
+callers use that when they want a value for a city that may lack its own sensor.
+"""
 
 from abc import ABC, abstractmethod
 from datetime import datetime

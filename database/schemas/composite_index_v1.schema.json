@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "composite_index_v1",
+  "title": "Composite index definition v1 (whitelist only)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "combine", "inputs", "transforms"],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "composite_index_v1"
+    },
+    "combine": {
+      "type": "string",
+      "enum": ["weighted_linear", "split_instant_vs_accumulated"]
+    },
+    "inputs": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 5,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["parameter_name", "temporal_class", "weight"],
+        "properties": {
+          "parameter_name": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]*$"
+          },
+          "temporal_class": {
+            "type": "string",
+            "enum": ["instantaneous", "accumulated_interval", "rate"]
+          },
+          "weight": { "type": "number" }
+        }
+      }
+    },
+    "transforms": {
+      "type": "object",
+      "additionalProperties": false,
+      "patternProperties": {
+        "^[a-z][a-z0-9_]*$": {
+          "type": "string",
+          "enum": ["none", "divide_by_interval_seconds"]
+        }
+      }
+    }
+  }
+}

@@ -1,8 +1,10 @@
 PyQt5>=5.15.0
 requests>=2.28.0
 matplotlib>=3.5.0
-pandas>=1.5.0
+pandas>=2.0.0
 python-dotenv>=1.0.0
 PyQtWebEngine>=5.15.0 # Required for interactive map in Stations tab
 qasync>=0.27.0 # Required for Qt + asyncio integration in sensor engine
 aiohttp>=3.8.0 # Required for async HTTP in sensor providers
+jsonschema>=4.0.0 # Strict validation for parameter_registry.backfill_support JSON
+pytest>=7.0.0 # tests/test_parameter_registry_sync.py
