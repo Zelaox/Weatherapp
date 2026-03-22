@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "heatmap_data_source_priority",
+  "type": "array",
+  "minItems": 1,
+  "items": {
+    "type": "string",
+    "enum": ["raw_latest", "aggregated_24h"]
+  },
+  "uniqueItems": true
+}

@@ -307,7 +307,7 @@ def _aggregate_scores(values: List[float], method: str) -> float:
 
 def compute_pm25_heatmap(
     db: Any,
-    valid_cities: List[Dict[str, Any]],
+    heatmap_input_points: List[Dict[str, Any]],
     extent: Optional[Tuple[float, float, float, float]],
     calib: Dict[str, float],
     *,
@@ -316,36 +316,46 @@ def compute_pm25_heatmap(
     now: Optional[datetime] = None,
 ) -> Tuple[List[List[float]], Dict[str, Any], Dict[str, Any]]:
     """
+    heatmap_input_points: list of selected_pm25 dicts with lat, lon, value, source
+    (raw_latest | aggregated_24h), optional city_id, measurement_ts, collector_ts.
+
     Returns:
       grid: sparse [lat, lon, value] rows
       meta: idw_meta (lat bounds, steps, grid_n, mean_interpolation_distance_km, ...)
       extra: heatmap_confidence, engine_config, heatmap_meta, cell_histogram, warning_codes
     """
-    if not valid_cities:
-        return [], {}, {"heatmap_confidence": {}, "engine_config": {}, "heatmap_meta": {}}
+    if not heatmap_input_points:
+        return [], {}, {"heatmap_confidence": {}, "engine_config": {}, "heatmap_meta": {}, "warning_codes": []}
 
     cfg_row = db.get_heatmap_interpolation_config_row(context_key)
     if cfg_row is None or not int(cfg_row.get("enabled", 1)):
         raise RuntimeError(f"heatmap interpolation config missing or disabled: {context_key!r}")
+
+    _priority, min_points_render, data_quality_weights = db.get_heatmap_dual_source_config(context_key)
 
     float_mode = str(cfg_row.get("float_precision_mode") or "raw")
     feat_rows = db.get_heatmap_confidence_features(context_key)
     agg_row = db.get_heatmap_confidence_aggregate_row(context_key)
     thr_row = db.get_heatmap_confidence_threshold_row(context_key)
 
-    lats = [float(c["latitude"]) for c in valid_cities]
-    lons = [float(c["longitude"]) for c in valid_cities]
-    vals = [float(c["pm25_24h"]) for c in valid_cities]
-    n = len(valid_cities)
+    for p in heatmap_input_points:
+        if not all(k in p for k in ("lat", "lon", "value", "source")):
+            raise RuntimeError(f"heatmap_input_points entry missing required keys (lat,lon,value,source): {p!r}")
+
+    lats = [float(p["lat"]) for p in heatmap_input_points]
+    lons = [float(p["lon"]) for p in heatmap_input_points]
+    vals = [float(p["value"]) for p in heatmap_input_points]
+    point_sources = [str(p["source"]) for p in heatmap_input_points]
+    n = len(heatmap_input_points)
 
     # Optional timestamps for temporal freshness (hours)
     now_dt = now or datetime.now()
     ts_basis = str(cfg_row.get("temporal_freshness_time_basis") or "measurement_time")
     station_hours: List[Optional[float]] = []
-    for c in valid_cities:
-        raw_ts = c.get("measurement_ts") or c.get("measurement_timestamp")
+    for p in heatmap_input_points:
+        raw_ts = p.get("measurement_ts") or p.get("measurement_timestamp")
         if ts_basis == "collector_time":
-            raw_ts = c.get("collector_ts") or c.get("timestamp")
+            raw_ts = p.get("collector_ts") or p.get("timestamp")
         station_hours.append(_parse_ts_hours(raw_ts, now_dt))
 
     if extent is not None:
@@ -412,6 +422,14 @@ def compute_pm25_heatmap(
     total_cells = grid_n * grid_n
     spatial_mode = resolve_spatial_index_mode(cfg_row, n_stations=n, grid_cells=total_cells)
 
+    skip_idw = n < min_points_render
+    if skip_idw:
+        logger.info(
+            "[Heatmap] Render guard: input_points=%s < min_points_render=%s (no IDW grid)",
+            n,
+            min_points_render,
+        )
+
     lat_step = (lat_max - lat_min) / grid_n
     lon_step = (lon_max - lon_min) / grid_n
 
@@ -435,95 +453,119 @@ def compute_pm25_heatmap(
                 return idx
         return None
 
-    for i in range(grid_n):
-        # Match legacy IDW: sample at grid corner (same as previous MapDataBuilder)
-        glat = lat_min + i * lat_step
-        for j in range(grid_n):
-            glon = lon_min + j * lon_step
+    if not skip_idw:
+        for i in range(grid_n):
+            # Match legacy IDW: sample at grid corner (same as previous MapDataBuilder)
+            glat = lat_min + i * lat_step
+            for j in range(grid_n):
+                glon = lon_min + j * lon_step
 
-            r_used = max_radius_km
-            if adaptive:
-                r_used = _adaptive_radius(glat, glon, lats, lons, vals, r_min=r_min, r_max=r_cap, r_step=r_step, min_points=min_points)
+                r_used = max_radius_km
+                if adaptive:
+                    r_used = _adaptive_radius(
+                        glat, glon, lats, lons, vals, r_min=r_min, r_max=r_cap, r_step=r_step, min_points=min_points
+                    )
 
-            inside = _stations_within_radius(glat, glon, lats, lons, vals, r_used)
-            n_pts = len(inside)
+                inside = _stations_within_radius(glat, glon, lats, lons, vals, r_used)
+                n_pts = len(inside)
 
-            if density_mode == "radius_based":
-                area_km2 = math.pi * max(r_used, 1e-6) ** 2
-                spatial_density = n_pts / max(area_km2, 1e-12)
-            else:
-                ca = _cell_area_km2(glat, lat_step, lon_step, cell_area_m)
-                spatial_density = n_pts / max(ca, 1e-12)
+                if density_mode == "radius_based":
+                    area_km2 = math.pi * max(r_used, 1e-6) ** 2
+                    spatial_density = n_pts / max(area_km2, 1e-12)
+                else:
+                    ca = _cell_area_km2(glat, lat_step, lon_step, cell_area_m)
+                    spatial_density = n_pts / max(ca, 1e-12)
 
-            if shrink_spec and adaptive:
-                try:
-                    fmul = _shrink_factor_from_spec(shrink_spec, spatial_density)
-                    r_used = max(r_min, min(r_cap, r_used / max(fmul, 1e-9)))
-                    inside = _stations_within_radius(glat, glon, lats, lons, vals, r_used)
-                    n_pts = len(inside)
-                except Exception as e:
-                    raise RuntimeError(f"radius_shrink_spec application failed: {e}") from e
+                if shrink_spec and adaptive:
+                    try:
+                        fmul = _shrink_factor_from_spec(shrink_spec, spatial_density)
+                        r_used = max(r_min, min(r_cap, r_used / max(fmul, 1e-9)))
+                        inside = _stations_within_radius(glat, glon, lats, lons, vals, r_used)
+                        n_pts = len(inside)
+                    except Exception as e:
+                        raise RuntimeError(f"radius_shrink_spec application failed: {e}") from e
 
-            val, _den, used, wn, wd = _idw_station_value(
-                glat, glon, lats, lons, vals, r_used, idw_power, decay_type
-            )
-            if math.isnan(val) or used < min_points:
-                continue
+                val, _den, used, wn, wd = _idw_station_value(
+                    glat, glon, lats, lons, vals, r_used, idw_power, decay_type
+                )
+                if math.isnan(val) or used < min_points:
+                    continue
 
-            if wd > 0:
-                mean_d = wn / wd
-                sum_mean_interp_km += mean_d
-                count_mean_interp += 1
-            else:
-                mean_d = 0.0
+                if wd > 0:
+                    mean_d = wn / wd
+                    sum_mean_interp_km += mean_d
+                    count_mean_interp += 1
+                else:
+                    mean_d = 0.0
 
-            # Per-cell score from normalized features
-            cell_score = None
-            if feature_defs:
-                acc = 0.0
-                for fr in feature_defs:
-                    fk = str(fr["feature_key"])
-                    wgt = float(fr["weight"])
-                    pk = str(fr["profile_key"])
-                    if fk == "cell_n_points":
-                        nv, _ = norm_engine.normalize_by_profile_key(pk, float(n_pts))
-                        if nv is None:
-                            raise RuntimeError(f"normalization None for {pk}")
-                        acc += wgt * float(nv)
-                    elif fk == "cell_mean_distance_km":
-                        nv, _ = norm_engine.normalize_by_profile_key(pk, float(mean_d))
-                        if nv is None:
-                            raise RuntimeError(f"normalization None for {pk}")
-                        acc += wgt * (1.0 - float(nv))
-                    elif fk == "cell_spatial_density":
-                        nv, _ = norm_engine.normalize_by_profile_key(pk, float(spatial_density))
-                        if nv is None:
-                            raise RuntimeError(f"normalization None for {pk}")
-                        acc += wgt * float(nv)
-                    elif fk == "temporal_freshness_hours":
-                        hrs_in_cell: List[float] = []
-                        for slat, slon, _sval, _d in inside:
-                            idx = _station_idx(slat, slon)
-                            if idx is not None and station_hours[idx] is not None:
-                                hrs_in_cell.append(float(station_hours[idx]))
-                        worst = max(hrs_in_cell) if hrs_in_cell else 0.0
-                        nv, _ = norm_engine.normalize_by_profile_key(pk, float(worst))
-                        if nv is None:
-                            raise RuntimeError(f"normalization None for {pk}")
-                        acc += wgt * (1.0 - float(nv))
-                    else:
-                        raise RuntimeError(f"unknown heatmap_confidence_feature.feature_key: {fk!r}")
-                cell_score = max(0.0, min(1.0, acc))
-                cell_score = apply_float_precision(cell_score, float_mode)
-                cell_scores.append(cell_score)
+                # Per-cell score from normalized features
+                cell_score = None
+                if feature_defs:
+                    acc = 0.0
+                    for fr in feature_defs:
+                        fk = str(fr["feature_key"])
+                        wgt = float(fr["weight"])
+                        pk = str(fr["profile_key"])
+                        if fk == "cell_n_points":
+                            nv, _ = norm_engine.normalize_by_profile_key(pk, float(n_pts))
+                            if nv is None:
+                                raise RuntimeError(f"normalization None for {pk}")
+                            acc += wgt * float(nv)
+                        elif fk == "cell_mean_distance_km":
+                            nv, _ = norm_engine.normalize_by_profile_key(pk, float(mean_d))
+                            if nv is None:
+                                raise RuntimeError(f"normalization None for {pk}")
+                            acc += wgt * (1.0 - float(nv))
+                        elif fk == "cell_spatial_density":
+                            nv, _ = norm_engine.normalize_by_profile_key(pk, float(spatial_density))
+                            if nv is None:
+                                raise RuntimeError(f"normalization None for {pk}")
+                            acc += wgt * float(nv)
+                        elif fk == "data_quality_type":
+                            w_list: List[float] = []
+                            for slat, slon, _sval, _d in inside:
+                                idx = _station_idx(slat, slon)
+                                if idx is not None:
+                                    src = point_sources[idx]
+                                    if src not in data_quality_weights:
+                                        raise RuntimeError(
+                                            f"data_quality_weights has no entry for source {src!r}"
+                                        )
+                                    w_list.append(float(data_quality_weights[src]))
+                            mean_q = sum(w_list) / len(w_list) if w_list else 0.0
+                            wmin = min(float(v) for v in data_quality_weights.values())
+                            wmax = max(float(v) for v in data_quality_weights.values())
+                            if wmax <= wmin:
+                                raise RuntimeError("data_quality_weights: max must exceed min")
+                            norm_q = (mean_q - wmin) / (wmax - wmin)
+                            nv, _ = norm_engine.normalize_by_profile_key(pk, float(norm_q))
+                            if nv is None:
+                                raise RuntimeError(f"normalization None for {pk}")
+                            acc += wgt * float(nv)
+                        elif fk == "temporal_freshness_hours":
+                            hrs_in_cell: List[float] = []
+                            for slat, slon, _sval, _d in inside:
+                                idx = _station_idx(slat, slon)
+                                if idx is not None and station_hours[idx] is not None:
+                                    hrs_in_cell.append(float(station_hours[idx]))
+                            worst = max(hrs_in_cell) if hrs_in_cell else 0.0
+                            nv, _ = norm_engine.normalize_by_profile_key(pk, float(worst))
+                            if nv is None:
+                                raise RuntimeError(f"normalization None for {pk}")
+                            acc += wgt * (1.0 - float(nv))
+                        else:
+                            raise RuntimeError(f"unknown heatmap_confidence_feature.feature_key: {fk!r}")
+                    cell_score = max(0.0, min(1.0, acc))
+                    cell_score = apply_float_precision(cell_score, float_mode)
+                    cell_scores.append(cell_score)
 
-            grid.append(
-                [
-                    apply_float_precision(glat, float_mode) if float_mode == "rounded_6dp" else round(glat, 5),
-                    apply_float_precision(glon, float_mode) if float_mode == "rounded_6dp" else round(glon, 5),
-                    apply_float_precision(val, float_mode) if float_mode == "rounded_6dp" else round(val, 3),
-                ]
-            )
+                grid.append(
+                    [
+                        apply_float_precision(glat, float_mode) if float_mode == "rounded_6dp" else round(glat, 5),
+                        apply_float_precision(glon, float_mode) if float_mode == "rounded_6dp" else round(glon, 5),
+                        apply_float_precision(val, float_mode) if float_mode == "rounded_6dp" else round(val, 3),
+                    ]
+                )
 
     mean_interp = (
         apply_float_precision(sum_mean_interp_km / count_mean_interp, float_mode)
@@ -612,6 +654,9 @@ def compute_pm25_heatmap(
     order = {"ok": 0, "low": 1, "unreliable": 2}
     level = gate_level if order[gate_level] >= order[score_level] else score_level
 
+    if skip_idw and "insufficient_data_density" not in reasons:
+        reasons.append("insufficient_data_density")
+
     formula_version = float(calib.get("heatmap_confidence_formula_version") or 1.0)
 
     dist_component: Optional[float] = None
@@ -652,6 +697,10 @@ def compute_pm25_heatmap(
         "spatial_index_mode": spatial_mode,
     }
 
+    warn_codes: List[str] = []
+    if skip_idw:
+        warn_codes.append("insufficient_data_density")
+
     extra: Dict[str, Any] = {
         "heatmap_confidence": heatmap_confidence,
         "engine_config": engine_config,
@@ -659,8 +708,11 @@ def compute_pm25_heatmap(
             "spatial_index_mode": spatial_mode,
             "adaptive_radius_enabled": adaptive,
             "density_mode": density_mode,
+            "min_points_render": int(min_points_render),
+            "total_input_points": int(n),
+            "skip_idw_grid": bool(skip_idw),
         },
-        "warning_codes": [],
+        "warning_codes": warn_codes,
     }
 
     if debug_mode:

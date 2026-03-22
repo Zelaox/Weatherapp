@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "heatmap_data_quality_weights",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["raw_latest", "aggregated_24h"],
+  "properties": {
+    "raw_latest": { "type": "number", "exclusiveMinimum": 0 },
+    "aggregated_24h": { "type": "number", "exclusiveMinimum": 0 }
+  }
+}

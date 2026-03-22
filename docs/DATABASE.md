@@ -100,18 +100,28 @@ Map payload includes `heatmap_confidence`, `heatmap_confidence_visual`, and `nor
 
 Migration: `database/migration_add_heatmap_interpolation_engine.sql` (runs after `calibration_parameters` exists). JSON columns are validated at startup via `DatabaseManager.validate_heatmap_engine_config()` (fail loud when `heatmap_interpolation_config` exists but JSON is invalid).
 
+**Dual PM2.5 source (raw latest vs 24h own-city aggregate):** `database/migration_add_heatmap_dual_source.sql` (runs when `heatmap_interpolation_config` exists but `data_source_priority` is missing). Adds:
+
+| Column | Role |
+|--------|------|
+| `data_source_priority` | JSON array, validated by `heatmap_data_source_priority.schema.json`: tokens `raw_latest`, `aggregated_24h` only — **order = priority** (first match wins; no silent fallback). |
+| `min_points_render` | Minimum **count of heatmap input points before IDW** (`len(heatmap_input_points)`); not grid cells. Below threshold: no IDW grid, `warning_codes` includes `insufficient_data_density`. |
+| `data_quality_weights` | JSON object, validated by `heatmap_data_quality_weights.schema.json`: numeric weights per source for per-cell `data_quality_type` confidence feature. |
+
+**Policy A (heatmap):** `aggregated_24h` uses **only** own-city 24h rolling mean (`get_rolling_average`); spatial nearest from `get_parameter_for_city_or_nearest` is **not** used for heatmap aggregation. Map markers/UI may still use nearest for `pm25_24h` display.
+
 | Object | Role |
 |--------|------|
-| `heatmap_interpolation_config` | One row per `context_key` (e.g. `pm25_heatmap`): grid bounds (`grid_resolution_min/max`, `bbox_padding_fraction`), IDW/radius, `spatial_index_rules`, `method_selection_rules`, `float_precision_mode`, `global_score_clipping`, optional `radius_shrink_spec`. |
-| `heatmap_confidence_feature` | Per-cell feature weights + `profile_key` for `NormalizationEngine`. |
+| `heatmap_interpolation_config` | One row per `context_key` (e.g. `pm25_heatmap`): grid bounds (`grid_resolution_min/max`, `bbox_padding_fraction`), IDW/radius, `spatial_index_rules`, `method_selection_rules`, `float_precision_mode`, `global_score_clipping`, optional `radius_shrink_spec`, plus dual-source columns above. |
+| `heatmap_confidence_feature` | Per-cell feature weights + `profile_key` for `NormalizationEngine` (includes optional `data_quality_type` → `heatmap_conf_data_quality` identity profile after dual migration). |
 | `heatmap_confidence_aggregate` | Global combine weights (`global_combine_w_*`), `cell_score_aggregation_method`, `low_cell_score_threshold`. |
 | `heatmap_confidence_threshold` | `score_unreliable_below`, `score_low_below` (overrides calibration score bands when present). |
 | `heatmap_render_debug` | Optional sampled cells when `heatmap_debug_sample_cells` > 0 and `debug_mode`; TTL via `heatmap_debug_retention_days`. |
-| `station_observation_latest` | VIEW: latest `pm25` per city from `weather_data` + `cities` (documentation / consumers). |
+| `station_observation_latest` | VIEW: **one row per city** — latest `pm25` by `COALESCE(measurement_timestamp, timestamp)` (window `ROW_NUMBER`), plus `collector_timestamp` (`weather_data.timestamp`). |
 
-Schemas: `database/schemas/heatmap_method_selection_rules.schema.json`, `heatmap_spatial_index_rules.schema.json`, `heatmap_radius_shrink_spec.schema.json`, `heatmap_global_score_clip.schema.json`.
+Schemas: `database/schemas/heatmap_method_selection_rules.schema.json`, `heatmap_spatial_index_rules.schema.json`, `heatmap_radius_shrink_spec.schema.json`, `heatmap_global_score_clip.schema.json`, `heatmap_data_source_priority.schema.json`, `heatmap_data_quality_weights.schema.json`.
 
-Runtime: `analytics/heatmap_interpolation.py` (`compute_pm25_heatmap`) — consumed by `MapDataBuilder.build()`.
+Runtime: `analytics/heatmap_interpolation.py` (`compute_pm25_heatmap` takes `heatmap_input_points` = list of `selected_pm25` dicts) — built in `MapDataBuilder.build()`.
 
 ### `map_tile_provider` (basemap / OSM policy)
 
