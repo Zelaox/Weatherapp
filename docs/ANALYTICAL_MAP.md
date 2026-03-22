@@ -501,8 +501,10 @@ The geographic extent of the map and of all heatmap layers (PM2.5, solar, storm)
 
 ### PM2.5 heatmap engine (DB-driven)
 
-- **Implementation:** `analytics/heatmap_interpolation.py` — IDW grid, optional adaptive radius / shrink JSON, spatial/method rule evaluation, per-cell normalized features from `heatmap_confidence_feature`, global score from `heatmap_confidence_aggregate`, gates still from `calibration_parameters` (station/coverage) plus `heatmap_confidence_threshold` for score bands.
-- **Payload:** `heatmap_engine` (`context_key`, `heatmap_engine_config_version`, `float_precision_mode`, …), `heatmap_meta` (`spatial_index_mode`, `density_mode`, …), `heatmap_warnings`, extended `heatmap_confidence` (`global_score`, `cell_score_histogram`, legacy `components` keys preserved for UI/tests).
+- **Implementation:** `analytics/heatmap_interpolation.py` — IDW grid, optional adaptive radius / shrink JSON, spatial/method rule evaluation, per-cell normalized features from `heatmap_confidence_feature` (including `data_quality_type` when migrated), global score from `heatmap_confidence_aggregate`, gates still from `calibration_parameters` (station/coverage) plus `heatmap_confidence_threshold` for score bands.
+- **Dual data path:** `MapDataBuilder` builds `heatmap_input_points` as a list of `selected_pm25` objects `{ lat, lon, value, source: raw_latest | aggregated_24h, city_id?, measurement_ts?, collector_ts? }`. Selection order comes from DB `data_source_priority` (first source with a value wins). **Policy A:** `aggregated_24h` is only own-city 24h rolling mean; nearest-station PM2.5 is not used for heatmap points (markers may still show nearest via `pm25_24h`). Raw values come from `VIEW station_observation_latest` (`DatabaseManager.get_station_observation_latest_pm25_rows()`).
+- **Render guard:** If `len(heatmap_input_points) < min_points_render` (from `heatmap_interpolation_config`), no IDW grid is produced; `warning_codes` includes `insufficient_data_density`.
+- **Payload:** `heatmap_engine` (`context_key`, `heatmap_engine_config_version`, `float_precision_mode`, …), `heatmap_meta` (`spatial_index_mode`, `density_mode`, `min_points_render`, `total_input_points`, selection counts, …), `heatmap_warnings`, extended `heatmap_confidence` (`global_score`, `cell_score_histogram`, legacy `components` keys preserved for UI/tests).
 - **Contracts:** JSON in `heatmap_interpolation_config` validated at startup; schemas under `database/schemas/heatmap_*.schema.json`. See [DATABASE.md](DATABASE.md) §2b.
 
 ### Solar, Storm, and Lightning Layers

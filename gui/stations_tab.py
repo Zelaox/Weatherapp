@@ -295,6 +295,91 @@ class MapDataBuilder:
         # No cities: return a minimal default box (avoid division by zero later)
         return (55.0, 56.0, 13.0, 14.0)
 
+    def _build_heatmap_input_points(
+        self,
+        all_cities: List[Dict],
+        city_weather_by_id: Dict[int, Dict],
+    ) -> Tuple[List[Dict], Dict[str, int]]:
+        """
+        heatmap_input_points = list of selected_pm25 per city.
+        Policy A: aggregated_24h only from own-city rolling mean (get_rolling_average), never nearest.
+        """
+        cfg = self.db.get_heatmap_interpolation_config_row("pm25_heatmap")
+        if not cfg:
+            return [], {"raw_points_count": 0, "aggregated_points_count": 0, "total_points_used": 0}
+        try:
+            priority, _mpr, _w = self.db.get_heatmap_dual_source_config("pm25_heatmap")
+        except RuntimeError as e:
+            logger.error("Heatmap dual source config: %s", e)
+            return [], {"raw_points_count": 0, "aggregated_points_count": 0, "total_points_used": 0}
+
+        raw_rows = self.db.get_station_observation_latest_pm25_rows()
+        raw_by_city: Dict[int, Dict] = {}
+        for r in raw_rows:
+            try:
+                cid = int(r["city_id"])
+            except (TypeError, ValueError, KeyError):
+                continue
+            raw_by_city[cid] = r
+
+        out: List[Dict] = []
+        n_raw = 0
+        n_agg = 0
+        for city in all_cities:
+            city_id = int(city["id"])
+            lat = float(city["latitude"])
+            lon = float(city["longitude"])
+            cw = city_weather_by_id.get(city_id)
+            candidates: Dict[str, Dict] = {}
+
+            rr = raw_by_city.get(city_id)
+            if rr is not None and rr.get("value") is not None:
+                try:
+                    v_raw = float(rr["value"])
+                except (TypeError, ValueError):
+                    v_raw = None
+                if v_raw is not None:
+                    candidates["raw_latest"] = {
+                        "lat": lat,
+                        "lon": lon,
+                        "value": v_raw,
+                        "source": "raw_latest",
+                        "city_id": city_id,
+                        "measurement_ts": rr.get("measurement_timestamp"),
+                        "collector_ts": rr.get("collector_timestamp"),
+                    }
+
+            own_agg = self.db.get_rolling_average(city_id, "pm25", hours=24)
+            if own_agg is not None:
+                candidates["aggregated_24h"] = {
+                    "lat": lat,
+                    "lon": lon,
+                    "value": float(own_agg),
+                    "source": "aggregated_24h",
+                    "city_id": city_id,
+                    "measurement_ts": (cw.get("measurement_ts") if cw else None),
+                    "collector_ts": (cw.get("timestamp") if cw else None),
+                }
+
+            chosen = None
+            for token in priority:
+                if token in candidates:
+                    chosen = candidates[token]
+                    break
+            if chosen:
+                out.append(chosen)
+                if chosen["source"] == "raw_latest":
+                    n_raw += 1
+                else:
+                    n_agg += 1
+
+        meta = {
+            "raw_points_count": n_raw,
+            "aggregated_points_count": n_agg,
+            "total_points_used": len(out),
+        }
+        return out, meta
+
     # ------------------------------------------------------------------
     # Public entry point
     # ------------------------------------------------------------------
@@ -450,6 +535,16 @@ class MapDataBuilder:
             f"(avg {total_trend // max(len(cities_out), 1)} per city)"
         )
 
+        heatmap_input_points, heatmap_point_meta = self._build_heatmap_input_points(
+            all_cities, city_weather_by_id
+        )
+        logger.info(
+            "[Heatmap] Dual-source selection: raw=%s aggregated=%s total_input=%s",
+            heatmap_point_meta.get("raw_points_count", 0),
+            heatmap_point_meta.get("aggregated_points_count", 0),
+            heatmap_point_meta.get("total_points_used", 0),
+        )
+
         # ---- Format sensors for raw marker layer ----
         sensors_out = self._format_sensors(all_sensors)
 
@@ -457,7 +552,7 @@ class MapDataBuilder:
         calib = self._get_calibration_params()
         idw_scale_percentile = calib['idw_scale_percentile']
         
-        if not valid_cities:
+        if not heatmap_input_points:
             idw_grid_raw, idw_meta = [], {}
             heatmap_extra = {
                 "heatmap_confidence": self._build_heatmap_confidence(
@@ -469,18 +564,21 @@ class MapDataBuilder:
                     debug_trace=self.debug_mode,
                 ),
                 "engine_config": {},
-                "heatmap_meta": {},
+                "heatmap_meta": dict(heatmap_point_meta),
                 "warning_codes": [],
             }
         else:
             idw_grid_raw, idw_meta, heatmap_extra = compute_pm25_heatmap(
                 self.db,
-                valid_cities,
+                heatmap_input_points,
                 map_extent,
                 calib,
                 context_key="pm25_heatmap",
                 debug_mode=self.debug_mode,
             )
+            hm_meta = heatmap_extra.get("heatmap_meta") or {}
+            hm_meta = {**hm_meta, **heatmap_point_meta}
+            heatmap_extra["heatmap_meta"] = hm_meta
         total_cells = 0
         if idw_meta:
             try:

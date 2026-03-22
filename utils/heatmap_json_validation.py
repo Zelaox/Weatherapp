@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Dict, Mapping, Union
+from typing import Any, Dict, List, Mapping, Sequence, Union
 
 _SCHEMA_DIR = Path(__file__).resolve().parent.parent / "database" / "schemas"
 
@@ -61,6 +61,47 @@ def validate_spatial_index_rules(value: Union[str, Mapping[str, Any], None]) -> 
         data = dict(value)
     _validate_with_jsonschema(data, "heatmap_spatial_index_rules.schema.json")
     return data
+
+
+def validate_data_source_priority(value: Union[str, Sequence[str], None]) -> List[str]:
+    """Non-empty list of unique tokens raw_latest | aggregated_24h (order = priority)."""
+    if value is None or (isinstance(value, str) and value.strip() == ""):
+        raise ValueError("data_source_priority is required")
+    if isinstance(value, str):
+        data = json.loads(value)
+    elif isinstance(value, (list, tuple)):
+        data = list(value)
+    else:
+        raise TypeError("data_source_priority must be JSON string or list")
+    schema = _load_schema("heatmap_data_source_priority.schema.json")
+    try:
+        import jsonschema
+
+        jsonschema.validate(instance=data, schema=schema)
+    except Exception as e:
+        if type(e).__name__ == "ValidationError":
+            raise ValueError(f"heatmap_data_source_priority validation failed: {e}") from e
+        raise
+    return [str(x) for x in data]
+
+
+def validate_data_quality_weights(value: Union[str, Mapping[str, Any], None]) -> Dict[str, float]:
+    if value is None or (isinstance(value, str) and value.strip() == ""):
+        raise ValueError("data_quality_weights is required")
+    if isinstance(value, str):
+        data = json.loads(value)
+    else:
+        data = dict(value)
+    schema = _load_schema("heatmap_data_quality_weights.schema.json")
+    try:
+        import jsonschema
+
+        jsonschema.validate(instance=data, schema=schema)
+    except Exception as e:
+        if type(e).__name__ == "ValidationError":
+            raise ValueError(f"heatmap_data_quality_weights validation failed: {e}") from e
+        raise
+    return {str(k): float(v) for k, v in data.items()}
 
 
 def validate_radius_shrink_spec(value: Union[str, Mapping[str, Any], None]) -> Dict[str, Any]:

@@ -17,6 +17,8 @@ from utils.backfill_support_validation import (
     validate_backfill_support,
 )
 from utils.heatmap_json_validation import (
+    validate_data_quality_weights,
+    validate_data_source_priority,
     validate_global_score_clip,
     validate_method_selection_rules,
     validate_spatial_index_rules,
@@ -947,6 +949,16 @@ class DatabaseManager:
                                 conn.executescript(f.read())
                             conn.commit()
                             logger.info("Migration klar: heatmap interpolation engine + confidence tables")
+
+                    cursor.execute("PRAGMA table_info(heatmap_interpolation_config)")
+                    hic_cols = [row[1] for row in cursor.fetchall()]
+                    if hic_cols and "data_source_priority" not in hic_cols:
+                        mdual = Path(__file__).parent / "migration_add_heatmap_dual_source.sql"
+                        if mdual.exists():
+                            with open(mdual, "r", encoding="utf-8") as f:
+                                conn.executescript(f.read())
+                            conn.commit()
+                            logger.info("Migration klar: heatmap dual PM2.5 source + VIEW station_observation_latest")
 
             except Exception as e:
                 logger.warning(f"Math layer migration block: {e}")
@@ -2955,6 +2967,51 @@ class DatabaseManager:
         except sqlite3.OperationalError:
             return None
 
+    def get_heatmap_dual_source_config(
+        self, context_key: str = "pm25_heatmap"
+    ) -> Tuple[List[str], int, Dict[str, float]]:
+        """
+        Parsed dual-source heatmap config: (data_source_priority, min_points_render, data_quality_weights).
+        Fail loud if migration not applied or JSON invalid.
+        """
+        row = self.get_heatmap_interpolation_config_row(context_key)
+        if row is None:
+            raise RuntimeError(f"heatmap_interpolation_config missing row {context_key!r}")
+        dsp = row.get("data_source_priority")
+        if dsp is None or str(dsp).strip() == "":
+            raise RuntimeError(
+                "heatmap_interpolation_config.data_source_priority missing; "
+                "run migration_add_heatmap_dual_source.sql"
+            )
+        priority = validate_data_source_priority(dsp)
+        try:
+            mpr = int(row.get("min_points_render"))
+        except (TypeError, ValueError):
+            mpr = 3
+        mpr = max(1, mpr)
+        weights = validate_data_quality_weights(row.get("data_quality_weights"))
+        return priority, mpr, weights
+
+    def get_station_observation_latest_pm25_rows(self) -> List[Dict[str, Any]]:
+        """
+        Rows from VIEW station_observation_latest (one latest pm25 row per city).
+        Empty list if view missing or error.
+        """
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                """
+                SELECT observation_id, city_id, latitude, longitude, parameter_name, value,
+                       measurement_timestamp, collector_timestamp
+                FROM station_observation_latest
+                """
+            )
+            return [dict(r) for r in cursor.fetchall()]
+        except sqlite3.OperationalError as e:
+            logger.warning("get_station_observation_latest_pm25_rows: %s", e)
+            return []
+
     def get_heatmap_confidence_features(self, context_key: str = "pm25_heatmap") -> List[Dict[str, Any]]:
         conn = self.get_connection()
         cursor = conn.cursor()
@@ -3060,6 +3117,12 @@ class DatabaseManager:
         validate_method_selection_rules(row.get("method_selection_rules"))
         validate_spatial_index_rules(row.get("spatial_index_rules"))
         validate_global_score_clip(row.get("global_score_clipping"))
+        dsp = row.get("data_source_priority")
+        if dsp is not None and str(dsp).strip() != "":
+            validate_data_source_priority(dsp)
+        dq = row.get("data_quality_weights")
+        if dq is not None and str(dq).strip() != "":
+            validate_data_quality_weights(dq)
         rs = row.get("radius_shrink_spec")
         if rs is not None and str(rs).strip() != "":
             from utils.heatmap_json_validation import validate_radius_shrink_spec
